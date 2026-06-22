@@ -629,9 +629,9 @@ apply_git_patches(){
   for name in "$@"; do
     while IFS= read -r f; do
       printf 'Applying patch: %s\n' "$f" >&2
-      git -C "$src" apply --unidiff-zero --verbose "$f" \
-        || git -C "$src" apply --verbose "$f" \
-        || patch -d "$src" -p1 < "$f"
+      git -C "$src" apply --unidiff-zero --verbose "$f" >&2 \
+        || git -C "$src" apply --verbose "$f" >&2 \
+        || patch -d "$src" -p1 < "$f" >&2
     done < <(layered_existing_files "$root" "$family" "$target" patches "$name")
   done
 }
@@ -1690,7 +1690,7 @@ cmd_rpm_graph_query_chroot(){
     spec="$graph_dir/specs/$node.spec"
 
     rpm_graph_chroot_emit_query P "$node" "$spec" rpmspec -q --qf '%{NAME}\n'
-    rpm_graph_chroot_emit_query P "$node" "$spec" rpmspec -q --provides
+    rpm_graph_chroot_emit_query P "$node" "$spec" rpmspec -q --qf '[%{PROVIDENAME}\n]'
     rpm_graph_chroot_emit_query B "$node" "$spec" rpmspec -q --buildrequires
     rpm_graph_chroot_emit_query R "$node" "$spec" rpmspec -q --requires
   done <"$graph_dir/nodes.tsv"
