@@ -1,0 +1,236 @@
+name: Build and Publish Package Repository
+
+on:
+  workflow_call:
+    inputs:
+      package-type:
+        required: true
+        type: string
+      app-id:
+        required: true
+        type: string
+      source-git:
+        required: false
+        type: string
+        default: ""
+      build-script:
+        required: false
+        type: string
+        default: ""
+      rebuild-trigger:
+        required: true
+        type: string
+      targets:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+  pages: write
+  id-token: write
+  packages: write
+
+concurrency:
+  group: publish-${{ inputs.package-type }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.prepare.outputs.changed }}
+      version-key: ${{ steps.prepare.outputs.version-key }}
+      build-container-json: ${{ steps.prepare.outputs.build-container-json }}
+      flatpak-arch: ${{ steps.prepare.outputs.flatpak-arch }}
+      gpg-cache-key: ${{ steps.prepare.outputs.gpg-cache-key }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v6
+
+      - name: Checkout publisher repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: publisher
+
+      - id: gpg-cache
+        name: Prepare | Restore GPG key
+        uses: actions/cache@v4
+        with:
+          path: gpg-key
+          key: package-gpg-key-v1
+
+      - id: prepare
+        name: Prepare | Validate, profile, GPG key, and rebuild trigger
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_TYPE: ${{ inputs.package-type }}
+          APP: ${{ inputs.app-id }}
+          SOURCE_GIT: ${{ inputs.source-git }}
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+          REBUILD_TRIGGER: ${{ inputs.rebuild-trigger }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          TARGETS: ${{ inputs.targets }}
+          GPG_CACHE_HIT: ${{ steps.gpg-cache.outputs.cache-hit }}
+        run: bash publisher/repository_builder.sh prepare
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    container: ${{ fromJSON(needs.prepare.outputs.build-container-json) }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v6
+
+      - name: Checkout publisher repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: publisher
+
+      - name: Build | Restore GPG key
+        uses: actions/cache/restore@v4
+        with:
+          path: gpg-key
+          key: ${{ needs.prepare.outputs.gpg-cache-key }}
+          fail-on-cache-miss: true
+
+      - id: gpg
+        name: Build | Shared setup
+        run: bash publisher/repository_builder.sh gpg setup
+      - id: flatpak-resolve
+        name: Flatpak | Prepare and resolve
+        if: inputs.package-type == 'flatpak'
+        env:
+          APP: ${{ inputs.app-id }}
+          SOURCE_GIT: ${{ inputs.source-git }}
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+        run: bash publisher/repository_builder.sh flatpak-prepare
+      - name: Flatpak | Build manifests with flatter
+        if: inputs.package-type == 'flatpak'
+        uses: andyholmes/flatter@main
+        with:
+          files: ${{ steps.flatpak-resolve.outputs.files }}
+          arch: ${{ needs.prepare.outputs.flatpak-arch }}
+          gpg-sign: ${{ steps.gpg.outputs.fingerprint }}
+          cache-key: flatpak-repo
+          flatpak-builder-args: --install-deps-from=flathub
+          upload-pages-artifact: true
+          upload-bundles: false
+
+      - id: package-cache
+        name: Package | Restore package cache
+        if: inputs.package-type == 'rpm' || inputs.package-type == 'deb'
+        uses: actions/cache/restore@v4
+        with:
+          path: package-cache
+          key: package-cache-${{ inputs.package-type }}-${{ runner.os }}-${{ needs.prepare.outputs.version-key }}-${{ github.run_id }}
+          restore-keys: |
+            package-cache-${{ inputs.package-type }}-${{ runner.os }}-${{ needs.prepare.outputs.version-key }}-
+            package-cache-${{ inputs.package-type }}-${{ runner.os }}-
+
+      - name: Package | Set up Docker Buildx
+        if: inputs.package-type == 'rpm' || inputs.package-type == 'deb'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Package | Log in to GHCR
+        if: inputs.package-type == 'rpm' || inputs.package-type == 'deb'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Package | Build repository
+        if: inputs.package-type == 'rpm' || inputs.package-type == 'deb'
+        env:
+          PACKAGE_TYPE: ${{ inputs.package-type }}
+          APP: ${{ inputs.app-id }}
+          SOURCE_GIT: ${{ inputs.source-git }}
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          FPR: ${{ steps.gpg.outputs.fingerprint }}
+          TARGETS: ${{ inputs.targets }}
+        run: bash publisher/repository_builder.sh build-container
+
+      - name: Package | Save package cache
+        if: always() && (inputs.package-type == 'rpm' || inputs.package-type == 'deb')
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: package-cache
+          key: package-cache-${{ inputs.package-type }}-${{ runner.os }}-${{ needs.prepare.outputs.version-key }}-${{ github.run_id }}
+
+      - name: Package | Upload package metadata
+        if: inputs.package-type == 'rpm' || inputs.package-type == 'deb'
+        uses: actions/upload-artifact@v5
+        with:
+          name: publisher-metadata
+          path: public/publisher-metadata
+          if-no-files-found: warn
+
+      - name: Package | Upload Pages artifact
+        if: inputs.package-type == 'rpm' || inputs.package-type == 'deb'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+
+  deploy:
+    needs: [prepare, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        name: Deploy Pages
+        uses: actions/deploy-pages@v5
+
+      - name: Deploy | Create rebuild marker
+        run: mkdir -p .cache-marker && printf '%s\n' "${{ needs.prepare.outputs.version-key }}" > .cache-marker/key
+
+      - name: Deploy | Mark rebuild state
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .cache-marker
+          key: ${{ needs.prepare.outputs.version-key }}
+
+  update-readme:
+    needs: [prepare, deploy]
+    if: needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout publisher repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: publisher
+
+      - name: Update README | Download package metadata
+        if: inputs.package-type == 'rpm' || inputs.package-type == 'deb'
+        continue-on-error: true
+        uses: actions/download-artifact@v5
+        with:
+          name: publisher-metadata
+          path: publisher-metadata
+
+      - name: Update README
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_TYPE: ${{ inputs.package-type }}
+          APP: ${{ inputs.app-id }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          REMOTE: ${{ github.event.repository.name }}
+        run: bash publisher/repository_builder.sh update-readme
