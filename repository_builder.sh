@@ -1092,8 +1092,116 @@ rpm_dump_mock_failure(){
     echo "--- no mock result logs found in $dir ---" >&2
   fi
 }
+rpm_diagnostic_trigger_options(){
+  printf '%s\n' \
+    --filetriggers \
+    --filetriggerin \
+    --filetriggerun \
+    --filetriggerpostun \
+    --transfiletriggerin \
+    --transfiletriggerun \
+    --transfiletriggerpostun
+}
+
+rpm_diagnostic_query_package(){
+  local mode="$1" package="$2" option
+
+  echo "--- $mode $package scripts ---"
+  rpm "$mode" --scripts "$package" 2>&1 || true
+
+  echo "--- $mode $package triggers ---"
+  rpm "$mode" --triggers "$package" 2>&1 || true
+
+  while IFS= read -r option; do
+    echo "--- $mode $package $option ---"
+    rpm "$mode" "$option" "$package" 2>&1 || true
+  done < <(rpm_diagnostic_trigger_options)
+}
+
+rpm_diagnostic_cached_dirs(){
+  local dir
+
+  for dir in /var/cache/dnf/*/packages /var/cache/libdnf5/*/packages /var/cache/zypp/packages/*/*; do
+    [[ -d "$dir" ]] || continue
+    printf '%s\n' "$dir"
+  done
+}
+
+rpm_diagnostic_base_candidate(){
+  local candidate="$1"
+
+  candidate="${candidate##*/}"
+  candidate="${candidate%.rpm}"
+  candidate="${candidate%.src}"
+  candidate="${candidate%.noarch}"
+  candidate="${candidate%.x86_64}"
+  candidate="${candidate%.aarch64}"
+  candidate="${candidate%.i686}"
+  candidate="${candidate%.armv7hl}"
+  candidate="${candidate%.armv7hnl}"
+  candidate="${candidate%.ppc64le}"
+  candidate="${candidate%.s390x}"
+
+  if [[ "$candidate" =~ ^(.+)-[0-9][^-]*-[^-]+$ ]]; then
+    candidate="${BASH_REMATCH[1]}"
+  fi
+
+  printf '%s\n' "$candidate"
+}
+
+rpm_diagnostic_query_cached_rpms_for_candidate(){
+  local candidate="$1" base dir rpm_file found=0
+
+  base="$(rpm_diagnostic_base_candidate "$candidate")"
+
+  echo "=== cached RPM metadata for candidate: $candidate ==="
+  while IFS= read -r dir; do
+    for rpm_file in "$dir"/"$candidate"*.rpm "$dir"/"$base"-*.rpm; do
+      [[ -f "$rpm_file" ]] || continue
+      found=1
+
+      echo "--- cached RPM: $rpm_file ---"
+      rpm -qp --queryformat 'name=%{NAME}\nversion=%{VERSION}\nrelease=%{RELEASE}\narch=%{ARCH}\n' "$rpm_file" 2>&1 || true
+      rpm_diagnostic_query_package -qp "$rpm_file"
+    done
+  done < <(rpm_diagnostic_cached_dirs)
+
+  ((found)) || echo "no cached RPM matched candidate: $candidate"
+  echo
+}
+
+rpm_diagnostic_candidates_from_logs(){
+  local result="$1" log line token candidate
+
+  shopt -s nullglob
+  for log in "$result"/*.log "$result"/*/*.log; do
+    [[ -f "$log" ]] || continue
+
+    while IFS= read -r line; do
+      case "$line" in
+        *'rpm package '*)
+          token="${line#*rpm package }"
+          token="${token%%[[:space:]:,;]*}"
+          printf '%s\n' "$token"
+          ;;
+      esac
+
+      while [[ "$line" =~ %[^\(]+\(([^\)]+)\) ]]; do
+        candidate="${BASH_REMATCH[1]}"
+        printf '%s\n' "$candidate"
+        line="${line#*${BASH_REMATCH[0]}}"
+      done
+    done <"$log"
+  done | awk 'NF && !seen[$0]++'
+  shopt -u nullglob
+}
+
 cmd_mock_diagnostics_chroot(){
-  local context="${1:-}" command package rpm_file found
+  local context="${1:-}" command option candidate
+
+  if (($#)); then
+    shift
+  fi
 
   set +e
 
@@ -1116,59 +1224,83 @@ cmd_mock_diagnostics_chroot(){
   echo
 
   echo "=== command availability ==="
-  for command in bash sh find cat sed grep awk rpm dnf dnf5 microdnf udevadm systemctl update-ca-trust lua; do
+  for command in bash sh find cat sed grep awk rpm dnf dnf5 microdnf systemctl lua; do
     printf '%s: ' "$command"
     command -v "$command" 2>/dev/null || echo missing
   done
   echo
 
-  echo "=== installed udev package ==="
-  rpm -q udev 2>&1 || true
-  echo
+  echo "=== rpm trigger query support ==="
+  local rpm_help
+  rpm_help="$(rpm --help 2>&1)"
 
-  echo "=== installed udev triggers ==="
-  rpm -q --triggers udev 2>&1 || true
-  echo
-
-  echo "=== installed udev scripts ==="
-  rpm -q --scripts udev 2>&1 || true
-  echo
-
-  echo "=== cached udev RPM triggers/scripts ==="
-  found=0
-  for rpm_file in /var/cache/dnf/*/packages/udev-*.rpm /var/cache/libdnf5/*/packages/udev-*.rpm /var/cache/zypp/packages/*/*/udev-*.rpm; do
-    [[ -f "$rpm_file" ]] || continue
-    found=1
-    echo "--- $rpm_file triggers ---"
-    rpm -qp --triggers "$rpm_file" 2>&1 || true
-    echo "--- $rpm_file scripts ---"
-    rpm -qp --scripts "$rpm_file" 2>&1 || true
+  for option in --scripts --triggers; do
+    printf '%s: ' "$option"
+    if [[ "$rpm_help" == *"$option"* ]]; then
+      echo supported
+    else
+      echo unknown
+    fi
   done
-  [[ "$found" == 1 ]] || echo "no cached udev RPM found"
+
+  while IFS= read -r option; do
+    printf '%s: ' "$option"
+    if [[ "$rpm_help" == *"$option"* ]]; then
+      echo supported
+    else
+      echo unknown
+    fi
+  done < <(rpm_diagnostic_trigger_options)
   echo
 
-  echo "=== installed scriptlet-sensitive packages ==="
-  rpm -qa 2>/dev/null | while IFS= read -r package; do
-    case "$package" in
-      udev-*|systemd-*|filesystem-*|rootcerts-*|rpm-*|dnf-*|lib64Qt6*|qt6-*|kf6-*|plasma-*|xdg-*|pipewire-*|dbus-*)
-        echo "$package"
-        ;;
-    esac
-  done || true
+  echo "=== diagnostic package candidates from mock logs ==="
+  if (($#)); then
+    printf '%s\n' "$@"
+  else
+    echo "no package candidates were extracted from mock logs"
+  fi
   echo
 
-  echo "=== rpm database last entries ==="
+  for candidate in "$@"; do
+    [[ -n "$candidate" ]] || continue
+
+    echo "=== installed RPM metadata for candidate: $candidate ==="
+    rpm_diagnostic_query_package -q "$candidate"
+    echo
+
+    rpm_diagnostic_query_cached_rpms_for_candidate "$candidate"
+  done
+
+  echo "=== dnf/libdnf/zypp cached package directories ==="
+  rpm_diagnostic_cached_dirs || true
+  echo
+
+  echo "=== recent rpm database entries ==="
   rpm -qa --last 2>&1 | head -80 || true
   echo
+
+  echo "=== script and trigger metadata for recent installed packages ==="
+  rpm -qa --last 2>/dev/null | head -${MOCK_DIAGNOSTIC_RECENT_PACKAGE_LIMIT:-30} | while IFS= read -r package _; do
+    [[ -n "$package" ]] || continue
+    rpm_diagnostic_query_package -q "$package"
+    echo
+  done || true
 }
 rpm_dump_mock_diagnostics(){
   local result="$1" target="$2" phase="$3" context="${4:-}" lines="${MOCK_LOG_TAIL_LINES:-300}"
-  local mock_args=() log quoted_context
+  local mock_args=() log diagnostic_command quoted_value candidate
 
   mkdir -p "$result"
   log="$result/chroot-diagnostics.log"
   rpm_mock_args_array "$target" "$phase" mock_args
-  printf -v quoted_context '%q' "$context"
+  printf -v quoted_value '%q' "$context"
+  diagnostic_command="bash /tmp/publisher/repository_builder.sh mock-diagnostics-chroot $quoted_value"
+
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    printf -v quoted_value '%q' "$candidate"
+    diagnostic_command+=" $quoted_value"
+  done < <(rpm_diagnostic_candidates_from_logs "$result")
 
   {
     echo "=== diagnostic context ==="
@@ -1181,7 +1313,7 @@ rpm_dump_mock_diagnostics(){
   if ! mock -r "$target" "${mock_args[@]}" \
     --enable-plugin bind_mount \
     --plugin-option "bind_mount:dirs=[('$ROOT', '/tmp/publisher')]" \
-    --chroot "bash /tmp/publisher/repository_builder.sh mock-diagnostics-chroot $quoted_context" >>"$log" 2>&1;
+    --chroot "$diagnostic_command" >>"$log" 2>&1;
   then
     echo "=== unable to run mock diagnostics inside chroot ===" >>"$log"
   fi
