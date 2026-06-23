@@ -629,7 +629,9 @@ apply_git_patches(){
   for name in "$@"; do
     while IFS= read -r f; do
       printf 'Applying patch: %s\n' "$f" >&2
-      git -C "$src" apply --verbose "$f" >&2
+      if ! git -C "$src" apply --verbose "$f" >&2; then
+        die "Failed to apply patch $f"
+      fi
     done < <(layered_existing_files "$root" "$family" "$target" patches "$name")
   done
 }
@@ -1634,7 +1636,9 @@ rpm_build_queued(){
   fresh_dir "$work";
   fresh_dir "$srpm_dir"
   copy_source_tree "$work/src" "$root"
-  spec_path="$(rpm_prepare_effective "$work/src" "$SUBDIR" "$SPEC" "$root" "$family" "$target")"
+  if ! spec_path="$(rpm_prepare_effective "$work/src" "$SUBDIR" "$SPEC" "$root" "$family" "$target")"; then
+    die "RPM spec preparation failed for $SPEC on $target"
+  fi
   spec_dir="$(dirname "$spec_path")"
   url="https://example.invalid/$SPEC"
 
@@ -1713,7 +1717,9 @@ rpm_graph_collect_node(){
   prepared="$graph/prepared/$node"
 
   copy_source_tree "$prepared" "$root"
-  spec_path="$(rpm_prepare_effective "$prepared" "$SUBDIR" "$SPEC" "$root" "$family" "$target")"
+  if ! spec_path="$(rpm_prepare_effective "$prepared" "$SUBDIR" "$SPEC" "$root" "$family" "$target")"; then
+    die "RPM graph spec preparation failed for $SPEC on $target"
+  fi
   printf '%s' "$spec_path" >"$graph/$node.specpath"
 }
 rpm_graph_prepare_chroot_tree(){
