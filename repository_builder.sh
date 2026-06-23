@@ -1542,6 +1542,34 @@ rpm_rebuild(){
   RPM_DIAGNOSTIC_SRPM="$srpm" RPM_DIAGNOSTIC_LOCAL_REPO="$local_repo" \
     rpm_mock_with_args "$result" "mock rebuild failed for $(basename "$srpm")" "$target" build "${rebuild_args[@]}"
 }
+rpm_fetch_sources_in_mock(){
+  local target="$1" result="$2" spec_dir="$3" spec_name="$4"
+  local chroot_spec_dir="/tmp/rpm-source-fetch" quoted_dir quoted_spec command
+
+  [[ -d "$spec_dir" ]] || die "Missing RPM source directory: $spec_dir"
+  [[ -f "$spec_dir/$spec_name" ]] || die "Missing RPM spec for source fetch: $spec_dir/$spec_name"
+
+  printf -v quoted_dir '%q' "$chroot_spec_dir"
+  printf -v quoted_spec '%q' "./$spec_name"
+  command="cd $quoted_dir && spectool -g -R $quoted_spec"
+
+  rpm_mock_with_args \
+    "$result/source-fetch" \
+    "mock source-fetch init failed for $spec_name on $target" \
+    "$target" \
+    build \
+    --init
+
+  rpm_mock_out_with_binds \
+    "$result/source-fetch" \
+    "mock source fetch failed for $spec_name on $target" \
+    "$target" \
+    build \
+    1 \
+    "$spec_dir" \
+    "$chroot_spec_dir" \
+    --chroot "$command" >/dev/null
+}
 rpm_copy_one(){
   local file="$1" repo="$2" source_repo="$3" local_repo="$4"
   local dest_name
@@ -1642,11 +1670,7 @@ rpm_build_queued(){
   spec_dir="$(dirname "$spec_path")"
   url="https://example.invalid/$SPEC"
 
-  if compgen -G "$spec_dir/*.tar.*" >/dev/null || compgen -G "$spec_dir/*.tgz" >/dev/null; then
-    :
-  else
-    spectool -g -R "$spec_path"
-  fi
+  rpm_fetch_sources_in_mock "$target" "$result" "$spec_dir" "$SPEC"
 
   rpm_build_srpm "$target" "srpm-$target-$build_id" "$srpm_dir" "$spec_dir" "$spec_path" "$url"
   srpm="$(find "$srpm_dir" -maxdepth 1 -name '*.src.rpm' -print -quit)"
