@@ -1596,27 +1596,30 @@ rpm_rebuild(){
   RPM_DIAGNOSTIC_SRPM="$srpm" RPM_DIAGNOSTIC_LOCAL_REPO="$local_repo" \
     rpm_mock_with_args "$result" "mock rebuild failed for $(basename "$srpm")" "$target" build "${rebuild_args[@]}"
 }
-cmd_rpm_fetch_sources_chroot(){
+cmd_rpm_list_sources_chroot(){
   local spec_dir="${1:-}"
   local spec_name="${2:-}"
-  local spec expanded line source filename
+  local output_name="${3:-}"
+  local spec expanded output line source count=0
 
-  (($# == 2)) || die "Usage: repository_builder.sh rpm-fetch-sources-chroot SPEC_DIR SPEC_NAME"
-  [[ -n "$spec_dir" && "$spec_dir" == /* ]] || die "RPM source-fetch chroot spec dir must be an absolute path"
-  [[ -n "$spec_name" && "$spec_name" != */* ]] || die "RPM source-fetch spec name must be a file name"
+  (($# == 3)) || die "Usage: repository_builder.sh rpm-list-sources-chroot SPEC_DIR SPEC_NAME OUTPUT_NAME"
+  [[ -n "$spec_dir" && "$spec_dir" == /* ]] || die "RPM source-list chroot spec dir must be an absolute path"
+  [[ -n "$spec_name" && "$spec_name" != */* ]] || die "RPM source-list spec name must be a file name"
+  [[ -n "$output_name" && "$output_name" != */* ]] || die "RPM source-list output name must be a file name"
 
   spec="$spec_dir/$spec_name"
-  [[ -d "$spec_dir" ]] || die "RPM source-fetch directory is missing inside chroot: $spec_dir"
-  [[ -f "$spec" ]] || die "RPM source-fetch spec is missing inside chroot: $spec"
+  output="$spec_dir/$output_name"
+  [[ -d "$spec_dir" ]] || die "RPM source-list directory is missing inside chroot: $spec_dir"
+  [[ -f "$spec" ]] || die "RPM source-list spec is missing inside chroot: $spec"
 
   command -v rpmspec >/dev/null 2>&1 || die "rpmspec is not installed in the mock chroot"
-  command -v curl >/dev/null 2>&1 || die "curl is not installed in the mock chroot"
 
   cd "$spec_dir"
   expanded=".repository-builder-expanded-spec.$$"
+  : >"$output"
 
   if ! rpmspec -P "./$spec_name" >"$expanded"; then
-    rm -f "$expanded"
+    rm -f "$expanded" "$output"
     die "rpmspec failed to expand $spec_name inside the mock chroot"
   fi
 
@@ -1635,48 +1638,116 @@ cmd_rpm_fetch_sources_chroot(){
     source="${source%"${source##*[![:space:]]}"}"
     [[ -n "$source" ]] || die "Empty Source entry in expanded spec: $spec_name"
 
-    case "$source" in
-      http://*|https://*|ftp://*)
-        filename="${source##*/}"
-        filename="${filename%%\?*}"
-        [[ -n "$filename" && "$filename" != . && "$filename" != .. && "$filename" != */* ]] || \
-          die "Cannot derive a safe local filename from source URL: $source"
-
-        echo "Downloading source: $source -> $filename" >&2
-        curl -fL --retry 3 --retry-delay 2 -o "$filename" "$source"
-        ;;
-      *://*)
-        die "Unsupported remote source URL scheme in $spec_name: $source"
-        ;;
-      *)
-        echo "Using local/non-remote source entry: $source" >&2
-        ;;
-    esac
+    printf '%s\n' "$source" >>"$output"
+    count=$((count + 1))
   done <"$expanded"
 
   rm -f "$expanded"
+  echo "Expanded $count Source entries from $spec_name" >&2
 }
+
+rpm_source_download_filename(){
+  local source="$1" download_url filename
+
+  download_url="${source%%#*}"
+
+  if [[ "$source" == *'#/'* ]]; then
+    filename="${source##*#/}"
+  elif [[ "$source" == *'#'* && "${source##*#}" != "" ]]; then
+    filename="${source##*#}"
+  else
+    filename="${download_url%%\?*}"
+    filename="${filename##*/}"
+  fi
+
+  [[ -n "$download_url" ]] || die "Cannot derive download URL from source: $source"
+  [[ -n "$filename" && "$filename" != . && "$filename" != .. && "$filename" != */* ]] || \
+    die "Cannot derive a safe local filename from source URL: $source"
+
+  printf '%s\t%s\n' "$download_url" "$filename"
+}
+
+rpm_download_expanded_sources_host(){
+  local spec_dir="$1" source_list="$2"
+  local cache_dir="/package-cache/source-downloads"
+  local source download_url filename url_hash cache_file tmp dest
+
+  [[ -d "$spec_dir" ]] || die "Missing RPM source directory: $spec_dir"
+  [[ -f "$source_list" ]] || die "Missing expanded RPM source list: $source_list"
+  command -v curl >/dev/null 2>&1 || die "curl is not installed in the host builder container"
+  mkdir -p "$cache_dir"
+
+  while IFS= read -r source; do
+    source="${source%$'\r'}"
+    [[ -n "$source" ]] || continue
+
+    case "$source" in
+      http://*|https://*|ftp://*)
+        IFS=$'\t' read -r download_url filename < <(rpm_source_download_filename "$source")
+        url_hash="$(printf '%s' "$source" | sha256_lines)"
+        cache_file="$cache_dir/${url_hash:0:32}-$filename"
+        tmp="$cache_file.tmp.$$"
+        dest="$spec_dir/$filename"
+
+        if [[ -s "$cache_file" ]]; then
+          echo "Using cached source: $source -> $filename" >&2
+        else
+          echo "Downloading source: $download_url -> $filename" >&2
+          rm -f "$tmp"
+          if ! curl -fL --retry 3 --retry-delay 2 -o "$tmp" "$download_url"; then
+            rm -f "$tmp"
+            die "Failed to download source: $source"
+          fi
+          if [[ ! -s "$tmp" ]]; then
+            rm -f "$tmp"
+            die "Downloaded source is empty: $source"
+          fi
+          mv "$tmp" "$cache_file"
+        fi
+
+        cp "$cache_file" "$dest"
+        ;;
+      *://*)
+        die "Unsupported remote source URL scheme after RPM macro expansion: $source"
+        ;;
+      /*)
+        [[ -f "$source" ]] || die "Expanded RPM Source file is missing: $source"
+        echo "Using local source: $source" >&2
+        ;;
+      *)
+        [[ -f "$spec_dir/$source" ]] || die "Expanded RPM Source file is missing: $spec_dir/$source"
+        echo "Using local source: $source" >&2
+        ;;
+    esac
+  done <"$source_list"
+}
+
 rpm_fetch_sources_in_mock(){
   local target="$1" result="$2" spec_dir="$3" spec_name="$4"
-  local chroot_spec_dir="/tmp/rpm-source-fetch" quoted_dir quoted_spec command
+  local chroot_spec_dir="/tmp/rpm-source-fetch" list_name list_path quoted_dir quoted_spec quoted_list command
 
   [[ -d "$spec_dir" ]] || die "Missing RPM source directory: $spec_dir"
   [[ -f "$spec_dir/$spec_name" ]] || die "Missing RPM spec for source fetch: $spec_dir/$spec_name"
 
+  list_name=".repository-builder-sources.$RANDOM.$$"
+  list_path="$spec_dir/$list_name"
+  rm -f "$list_path"
+
   printf -v quoted_dir '%q' "$chroot_spec_dir"
   printf -v quoted_spec '%q' "$spec_name"
-  command="bash /tmp/publisher/repository_builder.sh rpm-fetch-sources-chroot $quoted_dir $quoted_spec"
+  printf -v quoted_list '%q' "$list_name"
+  command="bash /tmp/publisher/repository_builder.sh rpm-list-sources-chroot $quoted_dir $quoted_spec $quoted_list"
 
   rpm_mock_with_args \
     "$result/source-fetch" \
-    "mock source-fetch init failed for $spec_name on $target" \
+    "mock source-list init failed for $spec_name on $target" \
     "$target" \
     build \
     --init
 
   rpm_mock_out_with_binds \
     "$result/source-fetch" \
-    "mock source fetch failed for $spec_name on $target" \
+    "mock source expansion failed for $spec_name on $target" \
     "$target" \
     build \
     2 \
@@ -1685,6 +1756,10 @@ rpm_fetch_sources_in_mock(){
     "$ROOT" \
     /tmp/publisher \
     --chroot "$command" >/dev/null
+
+  [[ -f "$list_path" ]] || die "Mock did not produce expanded source list for $spec_name"
+  rpm_download_expanded_sources_host "$spec_dir" "$list_path"
+  rm -f "$list_path"
 }
 rpm_copy_one(){
   local file="$1" repo="$2" source_repo="$3" local_repo="$4"
@@ -2659,8 +2734,8 @@ main(){
     rpm-graph-query-chroot)
       cmd_rpm_graph_query_chroot "$@"
       ;;
-    rpm-fetch-sources-chroot)
-      cmd_rpm_fetch_sources_chroot "$@"
+    rpm-list-sources-chroot)
+      cmd_rpm_list_sources_chroot "$@"
       ;;
     mock-diagnostics-chroot)
       cmd_mock_diagnostics_chroot "$@"
