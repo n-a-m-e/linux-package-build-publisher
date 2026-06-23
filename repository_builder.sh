@@ -325,6 +325,50 @@ target_container_image(){
 
 
 
+cached_builder_image(){
+  local package_type="$1"
+  local base_image="$2"
+  local build_cmd="$3"
+  local work cfile digest hash repo image
+
+  work="$ROOT/.builder-image/$package_type"
+  cfile="$work/Containerfile"
+  mkdir -p "$work"
+
+  digest="$(docker buildx imagetools inspect "$base_image" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+
+  cat >"$cfile" <<EOF
+FROM $base_image
+
+RUN $build_cmd
+EOF
+
+  hash="$(
+    {
+      printf 'package_type=%s\n' "$package_type"
+      printf 'base_digest=%s\n' "$digest"
+      printf 'build_cmd=%s\n' "$build_cmd"
+    } | sha256_lines
+  )"
+
+  repo="${BUILDER_IMAGE_REPO:-ghcr.io/${GITHUB_REPOSITORY:?}/builder}"
+  image="$repo:$package_type-${hash:0:16}"
+
+  if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+    printf '%s' "$image"
+    return 0
+  fi
+
+  docker buildx build \
+    --file "$cfile" \
+    --tag "$image" \
+    --push \
+    "$ROOT"
+
+  printf '%s' "$image"
+}
+
+
 repo_info(){
   local package_type="$1"
   local app="$2"
