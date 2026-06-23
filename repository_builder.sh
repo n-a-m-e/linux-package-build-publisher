@@ -98,11 +98,11 @@ load_apps_sources(){
 
   for source in "${SOURCES[@]}"; do
     [[ -n "$source" && "$source" != file://* ]] ||
-      die "SOURCE_GIT entries must be non-empty Git URLs; file:// is unsupported."
+      die "SOURCE_GIT entries must be Git URLs; file:// is unsupported."
   done
 
-  if ((${#SOURCES[@]} && ${#SOURCES[@]} != ${#APPS[@]})); then
-    die "SOURCE_GIT must be empty or contain exactly one Git URL per APP."
+  if ((${#SOURCES[@]} > 1 && ${#SOURCES[@]} != ${#APPS[@]})); then
+    die "SOURCE_GIT must contain zero entries, one Git URL, or one Git URL per APP."
   fi
 }
 
@@ -111,11 +111,11 @@ source_for_index(){
 
   if ((${#SOURCES[@]} == 0)); then
     printf ''
-    return 0
+  elif ((${#SOURCES[@]} == 1)); then
+    printf '%s' "${SOURCES[0]}"
+  else
+    printf '%s' "${SOURCES[$index]}"
   fi
-
-  ((index < ${#SOURCES[@]})) || die "Internal source index out of range: $index"
-  printf '%s' "${SOURCES[$index]}"
 }
 
 load_target_config_file(){
@@ -203,12 +203,7 @@ load_target_config_file(){
 }
 split_target(){
   local target="$1"
-
-  [[ "$target" == *-* ]] || die "Target must be FAMILY-ARCH: $target"
-  [[ "${target%-*}" != "$target" && "${target##*-}" != "$target" ]] || die "Target must be FAMILY-ARCH: $target"
-
-  printf '%s	%s
-' "${target%-*}" "${target##*-}"
+  printf '%s\t%s\n' "${target%-*}" "${target##*-}"
 }
 
 find_target_config(){
@@ -295,7 +290,7 @@ target_label(){
   load_target "$package_type" "$family" "$arch"
   suffix="${family#"${TARGET_LABEL_STRIP_PREFIX:-}"}"
 
-  case "$TARGET_LABEL_CASE" in
+  case "${TARGET_LABEL_CASE:-raw}" in
     title)
       suffix="$(sed -E 's/[-_]+/ /g; s/(^| )[a-z]/\U&/g' <<<"$suffix")"
       ;;
@@ -738,15 +733,10 @@ queue_source_dir(){
   local queue_work="$5"
   local root="$queue_work/src"
 
-  [[ -n "$source_id" ]] || die "Queue entry is missing SOURCE_ID"
-  [[ -n "$subdir" ]] || die "Queue entry is missing SUBDIR"
-
   if [[ -n "$clone_url" ]]; then
-    [[ -n "$ref" ]] || die "Queue entry with CLONE_URL must set REF"
-    checkout_source_tree "$clone_url" "$ref" "$root"
+    checkout_source_tree "$clone_url" "${ref:-main}" "$root"
     printf '%s' "$root/$subdir"
   else
-    [[ -z "$ref" ]] || die "Queue entry without CLONE_URL must not set REF"
     printf '%s' "/work/work/$source_id/$subdir"
   fi
 }
@@ -763,11 +753,11 @@ queue_layer_root(){
 cmd_package_build_queue(){
   local sub="${1:-}"
   local clone=""
-  local ref=""
-  local subdir=""
+  local ref="main"
+  local subdir="."
   local spec=""
   local package=""
-  local source_id="${SOURCE_ID:-}"
+  local source_id="${SOURCE_ID:-$PRIMARY_APP}"
   local safe
 
   if (($#)); then
@@ -810,16 +800,9 @@ cmd_package_build_queue(){
   done
 
   [[ -z "$clone" || "$clone" != file://* ]] || die "package-build-queue requires Git URLs when --clone-url is provided; file:// is unsupported."
-  [[ -n "$source_id" ]] || die "package-build-queue requires --source-id"
-  [[ -n "$subdir" ]] || die "package-build-queue requires --subdir"
-  [[ -n "$spec" ]] || die "package-build-queue requires --spec"
-  [[ -n "$package" ]] || die "package-build-queue requires --package"
 
-  if [[ -n "$clone" ]]; then
-    [[ -n "$ref" ]] || die "package-build-queue requires --ref when --clone-url is set"
-  else
-    [[ -z "$ref" ]] || die "package-build-queue does not accept --ref without --clone-url"
-  fi
+  [[ -n "$package" ]] || package="${spec%.spec}"
+  [[ -n "$package" ]] || package="$(basename "$subdir")"
 
   safe="$(safe_id "$source_id-$package-$subdir")"
   queue_write \
@@ -1474,11 +1457,13 @@ rpm_mock_out_with_binds(){
 
   mkdir -p "$result"
   if out="$(mock -r "$target" "${mock_args[@]}" "$@" 2>&1)"; then
-    printf '%s\n' "$out"
+    printf '%s
+' "$out"
     return 0
   fi
 
-  printf '%s\n' "$out" >&2
+  printf '%s
+' "$out" >&2
   rpm_dump_mock_failure "$result" "$msg"
   rpm_dump_mock_diagnostics "$result" "$target" "$phase" "$msg" "${RPM_DIAGNOSTIC_SRPM:-}" "${RPM_DIAGNOSTIC_LOCAL_REPO:-}"
   die "$msg"
@@ -1554,35 +1539,6 @@ rpm_rebuild(){
     rpm_mock_with_args "$result" "mock build dependency install failed for $(basename "$srpm")" "$target" build "${dep_args[@]}"
   RPM_DIAGNOSTIC_SRPM="$srpm" RPM_DIAGNOSTIC_LOCAL_REPO="$local_repo" \
     rpm_mock_with_args "$result" "mock rebuild failed for $(basename "$srpm")" "$target" build "${rebuild_args[@]}"
-}
-
-rpm_fetch_sources_in_mock(){
-  local target="$1" result="$2" spec_dir="$3" spec_name="$4"
-  local chroot_spec_dir="/tmp/rpm-source-fetch" quoted_dir quoted_spec command
-
-  [[ -d "$spec_dir" ]] || die "Missing RPM source directory: $spec_dir"
-  [[ -f "$spec_dir/$spec_name" ]] || die "Missing RPM spec for source fetch: $spec_dir/$spec_name"
-
-  printf -v quoted_dir '%q' "$chroot_spec_dir"
-  printf -v quoted_spec '%q' "./$spec_name"
-  command="cd $quoted_dir && spectool -g -R $quoted_spec"
-
-  rpm_mock_with_args \
-    "$result/source-fetch" \
-    "mock source-fetch init failed for $spec_name on $target" \
-    "$target" \
-    build \
-    --init
-
-  rpm_mock_out_with_binds \
-    "$result/source-fetch" \
-    "mock source fetch failed for $spec_name on $target" \
-    "$target" \
-    build \
-    1 \
-    "$spec_dir" \
-    "$chroot_spec_dir" \
-    --chroot "$command" >/dev/null
 }
 rpm_copy_one(){
   local file="$1" repo="$2" source_repo="$3" local_repo="$4"
@@ -1664,11 +1620,11 @@ rpm_build_queued(){
   repo="$PUBLIC_DIR/$repo_path"
   src_repo="$repo/source"
   local_repo="/work/localrepo-$target"
-  root="/work/work/${SOURCE_ID:?}"
+  root="/work/work/${SOURCE_ID:-$PRIMARY_APP}"
 
   mkdir -p "$cache" "$result" "$repo" "$src_repo" "$local_repo"
   createrepo_c "$local_repo"
-  fp="$(rpm_queue_fingerprint "$target" "$family" "$arch" "$root" "$SPEC" "$SOURCE_ID" "$SUBDIR")"
+  fp="$(rpm_queue_fingerprint "$target" "$family" "$arch" "$root" "$SPEC" "${SOURCE_ID:-$PRIMARY_APP}" "$SUBDIR")"
   if [[ -f "$cache/.fingerprint" && "$(cat "$cache/.fingerprint")" == "$fp" ]] && compgen -G "$cache/*.rpm" >/dev/null;
   then
     rpm_copy_artifacts "$cache" "$repo" "$src_repo" "$local_repo"
@@ -1682,7 +1638,11 @@ rpm_build_queued(){
   spec_dir="$(dirname "$spec_path")"
   url="https://example.invalid/$SPEC"
 
-  rpm_fetch_sources_in_mock "$target" "$result" "$spec_dir" "$SPEC"
+  if compgen -G "$spec_dir/*.tar.*" >/dev/null || compgen -G "$spec_dir/*.tgz" >/dev/null; then
+    :
+  else
+    spectool -g -R "$spec_path"
+  fi
 
   rpm_build_srpm "$target" "srpm-$target-$build_id" "$srpm_dir" "$spec_dir" "$spec_path" "$url"
   srpm="$(find "$srpm_dir" -maxdepth 1 -name '*.src.rpm' -print -quit)"
@@ -1749,7 +1709,7 @@ rpm_graph_collect_node(){
 
   load_queue "$qfile"
 
-  root="/work/work/${SOURCE_ID:?}"
+  root="/work/work/${SOURCE_ID:-$PRIMARY_APP}"
   prepared="$graph/prepared/$node"
 
   copy_source_tree "$prepared" "$root"
@@ -1926,9 +1886,7 @@ deb_prepare_effective(){
 }
 deb_graph_node_id(){
   load_queue "$1"
-  [[ -n "${PACKAGE:-}" ]] || die "Queue entry is missing PACKAGE: $1"
-  [[ -n "${SUBDIR:-}" ]] || die "Queue entry is missing SUBDIR: $1"
-  safe_id "$PACKAGE-$SUBDIR"
+  safe_id "${PACKAGE:-${SOURCE_ID:-package}}-${SUBDIR:-.}"
 }
 deb_dep_names(){
   sed -E 's/\([^)]*\)//g; s/\[[^]]*\]//g; s/<[^>]*>//g; s/\|/,/g; s/,/\n/g' \
@@ -2006,14 +1964,12 @@ deb_graph_collect_node(){
 
   load_queue "$qfile"
 
-  [[ -n "${PACKAGE:-}" ]] || die "Queue entry is missing PACKAGE: $qfile"
-  [[ -n "${SOURCE_ID:-}" ]] || die "Queue entry is missing SOURCE_ID: $qfile"
-  package="$PACKAGE"
-  source_id="$SOURCE_ID"
+  package="${PACKAGE:-${SOURCE_ID:-package}}"
+  source_id="${SOURCE_ID:-$PRIMARY_APP}"
   queue_work="$graph/queue-src/$node"
   prepared="$graph/prepared/$node"
 
-  source_dir="$(queue_source_dir "${CLONE_URL:-}" "${REF:-}" "$source_id" "$SUBDIR" "$queue_work")"
+  source_dir="$(queue_source_dir "$CLONE_URL" "${REF:-main}" "$source_id" "${SUBDIR:-.}" "$queue_work")"
   layer_root="$(queue_layer_root "$source_id" "$queue_work")"
 
   deb_prepare_effective "$prepared" "$source_dir" "$target" "$family" "$package" "$layer_root"
@@ -2056,10 +2012,8 @@ deb_build_queued(){
 
   load_queue "$qfile"
 
-  [[ -n "${PACKAGE:-}" ]] || die "Queue entry is missing PACKAGE: $qfile"
-  [[ -n "${SOURCE_ID:-}" ]] || die "Queue entry is missing SOURCE_ID: $qfile"
-  package="$PACKAGE"
-  source_id="$SOURCE_ID"
+  package="${PACKAGE:-${SOURCE_ID:-package}}"
+  source_id="${SOURCE_ID:-$PRIMARY_APP}"
   queue_work="/work/deb-source-src/$target/$package"
   build="/work/deb-build/$target/$package"
   result="/work/deb-result/$target/$package"
@@ -2067,7 +2021,7 @@ deb_build_queued(){
 
   mkdir -p "$repo/pool" "$build" "$result"
 
-  source_dir="$(queue_source_dir "${CLONE_URL:-}" "${REF:-}" "$source_id" "$SUBDIR" "$queue_work")"
+  source_dir="$(queue_source_dir "$CLONE_URL" "${REF:-main}" "$source_id" "${SUBDIR:-.}" "$queue_work")"
   layer_root="$(queue_layer_root "$source_id" "$queue_work")"
 
   deb_prepare_effective "$build/src" "$source_dir" "$target" "$family" "$package" "$layer_root"
@@ -2558,7 +2512,7 @@ main(){
         *) die "Usage: repository_builder.sh gpg {generate|setup}" ;;
       esac
       ;;
-    package-build-queue)
+    package-build-queue|queue)
       cmd_package_build_queue "$@"
       ;;
     build-container)
