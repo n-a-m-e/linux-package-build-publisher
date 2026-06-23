@@ -629,8 +629,8 @@ apply_git_patches(){
   for name in "$@"; do
     while IFS= read -r f; do
       printf 'Applying patch: %s\n' "$f" >&2
-      if ! git -C "$src" apply --verbose "$f" >&2; then
-        die "Failed to apply patch $f"
+      if ! git -C "$src" apply --unidiff-zero --verbose "$f" >&2; then
+        die "Failed to apply zero-context patch $f"
       fi
     done < <(layered_existing_files "$root" "$family" "$target" patches "$name")
   done
