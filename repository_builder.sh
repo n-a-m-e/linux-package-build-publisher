@@ -1181,18 +1181,35 @@ rpm_diagnostic_transaction_sections_from_logs(){
     found=1
     echo "--- ${log#$result/} ---"
     awk '
-      /^(Installing|Installing dependencies|Installing weak dependencies|Installing group\/module packages|Upgrading|Downgrading|Reinstalling|Removing):[[:space:]]*$/ {
-        section=$0
+      function normalize(line, out) {
+        out = line
+        sub(/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9:.]+Z[[:space:]]*/, "", out)
+        sub(/^DEBUG[[:space:]]+util\.py:[0-9]+:[[:space:]]*/, "", out)
+        sub(/^INFO[[:space:]]+util\.py:[0-9]+:[[:space:]]*/, "", out)
+        return out
+      }
+      {
+        line = normalize($0)
+        trimmed = line
+        sub(/^[[:space:]]+/, "", trimmed)
+      }
+      trimmed ~ /^(Installing|Installing dependencies|Installing weak dependencies|Installing group\/module packages|Upgrading|Downgrading|Reinstalling|Removing):[[:space:]]*$/ {
+        section = trimmed
         sub(/:[[:space:]]*$/, "", section)
         print "[" section "]"
         next
       }
-      /^(Transaction Summary|Running transaction check|Running transaction test|Running transaction|Complete!|Error:)/ {
-        section=""
+      trimmed ~ /^(Transaction Summary|Running transaction check|Running transaction test|Running transaction|Complete!|Error:)/ {
+        section = ""
+        next
       }
-      section && /^[[:space:]]+[A-Za-z0-9_.:+-]+[[:space:]]/ {
-        name=$1
-        if (name !~ /^(Package|Arch|Version|Repository|Size)$/) {
+      section {
+        row = line
+        sub(/^[[:space:]]+/, "", row)
+        if (row == "" || row ~ /^=+$/ || row ~ /^Package[[:space:]]+Arch[[:space:]]+/) next
+        split(row, fields, /[[:space:]]+/)
+        name = fields[1]
+        if (name != "" && name !~ /^(Package|Arch|Version|Repository|Size|\[SKIPPED\])$/) {
           print section "\t" name
         }
       }
@@ -1213,18 +1230,35 @@ rpm_diagnostic_transaction_packages_from_logs(){
   for log in "$result"/*.log "$result"/*/*.log; do
     [[ -f "$log" ]] || continue
     awk '
-      /^(Installing|Installing dependencies|Installing weak dependencies|Installing group\/module packages|Upgrading|Downgrading|Reinstalling|Removing):[[:space:]]*$/ {
-        section=$0
+      function normalize(line, out) {
+        out = line
+        sub(/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9:.]+Z[[:space:]]*/, "", out)
+        sub(/^DEBUG[[:space:]]+util\.py:[0-9]+:[[:space:]]*/, "", out)
+        sub(/^INFO[[:space:]]+util\.py:[0-9]+:[[:space:]]*/, "", out)
+        return out
+      }
+      {
+        line = normalize($0)
+        trimmed = line
+        sub(/^[[:space:]]+/, "", trimmed)
+      }
+      trimmed ~ /^(Installing|Installing dependencies|Installing weak dependencies|Installing group\/module packages|Upgrading|Downgrading|Reinstalling|Removing):[[:space:]]*$/ {
+        section = trimmed
         sub(/:[[:space:]]*$/, "", section)
         next
       }
-      /^(Transaction Summary|Running transaction check|Running transaction test|Running transaction|Complete!|Error:)/ {
-        section=""
+      trimmed ~ /^(Transaction Summary|Running transaction check|Running transaction test|Running transaction|Complete!|Error:)/ {
+        section = ""
+        next
       }
-      section && /^[[:space:]]+[A-Za-z0-9_.:+-]+[[:space:]]/ {
-        name=$1
-        if (name !~ /^(Package|Arch|Version|Repository|Size)$/) {
-          key=section "\t" name
+      section {
+        row = line
+        sub(/^[[:space:]]+/, "", row)
+        if (row == "" || row ~ /^=+$/ || row ~ /^Package[[:space:]]+Arch[[:space:]]+/) next
+        split(row, fields, /[[:space:]]+/)
+        name = fields[1]
+        if (name != "" && name !~ /^(Package|Arch|Version|Repository|Size|\[SKIPPED\])$/) {
+          key = section "\t" name
           if (!seen[key]++) print key
         }
       }
