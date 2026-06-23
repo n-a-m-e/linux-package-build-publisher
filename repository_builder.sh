@@ -1206,6 +1206,60 @@ rpm_diagnostic_transaction_sections_from_logs(){
   echo
 }
 
+rpm_diagnostic_transaction_packages_from_logs(){
+  local result="$1" log
+
+  shopt -s nullglob
+  for log in "$result"/*.log "$result"/*/*.log; do
+    [[ -f "$log" ]] || continue
+    awk '
+      /^(Installing|Installing dependencies|Installing weak dependencies|Installing group\/module packages|Upgrading|Downgrading|Reinstalling|Removing):[[:space:]]*$/ {
+        section=$0
+        sub(/:[[:space:]]*$/, "", section)
+        next
+      }
+      /^(Transaction Summary|Running transaction check|Running transaction test|Running transaction|Complete!|Error:)/ {
+        section=""
+      }
+      section && /^[[:space:]]+[A-Za-z0-9_.:+-]+[[:space:]]/ {
+        name=$1
+        if (name !~ /^(Package|Arch|Version|Repository|Size)$/) {
+          key=section "\t" name
+          if (!seen[key]++) print key
+        }
+      }
+    ' "$log" || true
+  done | awk -F '\t' 'NF >= 2 && !seen[$1 "\t" $2]++'
+  shopt -u nullglob
+}
+
+rpm_diagnostic_scriptlet_failures_from_logs(){
+  local result="$1" log line owner active
+
+  echo "=== scriptlet / trigger failures from mock logs ==="
+  shopt -s nullglob
+  for log in "$result"/*.log "$result"/*/*.log; do
+    [[ -f "$log" ]] || continue
+    owner=""
+    active=""
+    while IFS= read -r line; do
+      if [[ "$line" =~ %([A-Za-z0-9_]+)\(([^\)]+)\) ]]; then
+        owner="${BASH_REMATCH[1]}(${BASH_REMATCH[2]})"
+        echo "trigger_owner\t$owner"
+      fi
+      case "$line" in
+        *'scriptlet in rpm package '*)
+          active="${line#*scriptlet in rpm package }"
+          active="${active%%[[:space:]:,;]*}"
+          echo "active_package\t$active"
+          ;;
+      esac
+    done <"$log"
+  done
+  shopt -u nullglob
+  echo
+}
+
 rpm_diagnostic_repoquery_whatprovides(){
   local requirement="$1"
 
@@ -1283,6 +1337,21 @@ rpm_diagnostic_cached_dirs(){
   done
 }
 
+rpm_diagnostic_cached_rpm_paths_for_candidate(){
+  local candidate="$1" base dir rpm_file count=0 limit="${MOCK_DIAGNOSTIC_CACHED_RPM_LIMIT:-10}"
+
+  base="$(rpm_diagnostic_base_candidate "$candidate")"
+
+  while IFS= read -r dir; do
+    for rpm_file in "$dir"/"$candidate"*.rpm "$dir"/"$base"-*.rpm; do
+      [[ -f "$rpm_file" ]] || continue
+      printf '%s\n' "$rpm_file"
+      count=$((count + 1))
+      ((count < limit)) || return 0
+    done
+  done < <(rpm_diagnostic_cached_dirs)
+}
+
 rpm_diagnostic_base_candidate(){
   local candidate="$1"
 
@@ -1353,17 +1422,202 @@ rpm_diagnostic_candidates_from_logs(){
   shopt -u nullglob
 }
 
+
+rpm_diagnostic_capability_name(){
+  local value="$1"
+
+  value="${value%$'\r'}"
+  value="${value#${value%%[![:space:]]*}}"
+  value="${value%${value##*[![:space:]]}}"
+  value="${value%%[[:space:]]*}"
+  printf '%s\n' "$value"
+}
+
+rpm_diagnostic_write_transaction_package_metadata(){
+  local pkg="$1" out_dir="$2" req_file="$out_dir/$pkg.requires" prov_file="$out_dir/$pkg.provides"
+  local rpm_file used=0
+
+  : >"$req_file"
+  : >"$prov_file"
+
+  if rpm -q "$pkg" >/dev/null 2>&1; then
+    rpm -q --requires "$pkg" >>"$req_file" 2>&1 || true
+    rpm -q --provides "$pkg" >>"$prov_file" 2>&1 || true
+    used=1
+  fi
+
+  if ! ((used)); then
+    while IFS= read -r rpm_file; do
+      [[ -f "$rpm_file" ]] || continue
+      echo "# cached rpm: $rpm_file" >>"$req_file"
+      rpm -qp --requires "$rpm_file" >>"$req_file" 2>&1 || true
+      echo "# cached rpm: $rpm_file" >>"$prov_file"
+      rpm -qp --provides "$rpm_file" >>"$prov_file" 2>&1 || true
+      used=1
+    done < <(rpm_diagnostic_cached_rpm_paths_for_candidate "$pkg")
+  fi
+
+  if ! ((used)); then
+    echo "# no installed or cached RPM metadata found for $pkg" >>"$req_file"
+    echo "# no installed or cached RPM metadata found for $pkg" >>"$prov_file"
+  fi
+}
+
+rpm_diagnostic_report_reverse_dependencies(){
+  local transaction_path="$1" output_root="${2:-}" limit="${MOCK_DIAGNOSTIC_TRANSACTION_PACKAGE_LIMIT:-250}"
+  local metadata_dir pkg_file pkg section pkg req_pkg req_line req_cap prov_pkg prov_line prov_cap count=0
+  local packages=()
+
+  echo "=== transaction dependency report ==="
+
+  if [[ ! -r "$transaction_path" ]]; then
+    echo "transaction package list is not readable inside chroot: $transaction_path"
+    echo
+    return 0
+  fi
+
+  if [[ -n "$output_root" && -d "$output_root" ]]; then
+    metadata_dir="$output_root/transaction-rpm-metadata"
+  else
+    metadata_dir="/tmp/repository-builder-transaction-rpm-metadata.$$"
+  fi
+  rm -rf "$metadata_dir"
+  mkdir -p "$metadata_dir"
+
+  pkg_file="$metadata_dir/packages.tsv"
+  : >"$pkg_file"
+
+  while IFS=$'\t' read -r section pkg _; do
+    [[ -n "$section" && -n "$pkg" ]] || continue
+    case "$pkg" in Package|Arch|Version|Repository|Size) continue ;; esac
+    if ! grep -Fqx "$pkg" "$metadata_dir/package-names" 2>/dev/null; then
+      printf '%s\n' "$pkg" >>"$metadata_dir/package-names"
+      printf '%s\t%s\n' "$section" "$pkg" >>"$pkg_file"
+      packages+=("$pkg")
+      count=$((count + 1))
+      if ((count >= limit)); then
+        echo "transaction metadata collection stopped after $limit packages"
+        break
+      fi
+    fi
+  done <"$transaction_path"
+
+  if ! ((${#packages[@]})); then
+    echo "no transaction packages were parsed"
+    echo
+    return 0
+  fi
+
+  echo "transaction packages: ${#packages[@]}"
+  echo "metadata directory: $metadata_dir"
+  echo
+
+  for pkg in "${packages[@]}"; do
+    rpm_diagnostic_write_transaction_package_metadata "$pkg" "$metadata_dir"
+  done
+
+  while IFS=$'\t' read -r section pkg; do
+    [[ -n "$pkg" ]] || continue
+    echo "--- package: $pkg [$section] ---"
+    echo "provided capabilities used by other transaction packages:"
+    local any=0
+
+    while IFS= read -r prov_line; do
+      [[ -n "$prov_line" && "$prov_line" != \#* ]] || continue
+      prov_cap="$(rpm_diagnostic_capability_name "$prov_line")"
+      [[ -n "$prov_cap" ]] || continue
+
+      for req_pkg in "${packages[@]}"; do
+        [[ "$req_pkg" != "$pkg" ]] || continue
+        while IFS= read -r req_line; do
+          [[ -n "$req_line" && "$req_line" != \#* ]] || continue
+          req_cap="$(rpm_diagnostic_capability_name "$req_line")"
+          [[ -n "$req_cap" ]] || continue
+          if [[ "$req_cap" == "$prov_cap" ]]; then
+            printf '  %s requires: %s  [matched provide: %s]\n' "$req_pkg" "$req_line" "$prov_line"
+            any=1
+          fi
+        done <"$metadata_dir/$req_pkg.requires"
+      done
+    done <"$metadata_dir/$pkg.provides"
+
+    ((any)) || echo "  none found by capability-name match"
+    echo
+  done <"$pkg_file"
+}
+
+rpm_diagnostic_check_trigger_commands(){
+  local candidate="$1" trigger_output command_path command_name seen_file="/tmp/repository-builder-trigger-commands.$$"
+
+  : >"$seen_file"
+  trigger_output="$(
+    rpm -q --triggers "$candidate" 2>/dev/null || true
+    rpm -q --filetriggers "$candidate" 2>/dev/null || true
+    rpm -q --transfiletriggerin "$candidate" 2>/dev/null || true
+  )"
+  [[ -n "$trigger_output" ]] || {
+    rm -f "$seen_file"
+    return 0
+  }
+
+  echo "=== trigger command availability: $candidate ==="
+  while [[ "$trigger_output" =~ rpm\.execute\(\"([^\"]+)\" ]]; do
+    command_path="${BASH_REMATCH[1]}"
+    trigger_output="${trigger_output#*${BASH_REMATCH[0]}}"
+    grep -Fqx "$command_path" "$seen_file" 2>/dev/null && continue
+    printf '%s\n' "$command_path" >>"$seen_file"
+
+    if [[ "$command_path" == /* ]]; then
+      if [[ -x "$command_path" ]]; then
+        echo "$command_path: present executable"
+      elif [[ -e "$command_path" ]]; then
+        echo "$command_path: present but not executable"
+      else
+        echo "$command_path: missing"
+      fi
+    else
+      command_name="$command_path"
+      if command -v "$command_name" >/dev/null 2>&1; then
+        printf '%s: ' "$command_name"
+        command -v "$command_name"
+      else
+        echo "$command_name: missing"
+      fi
+    fi
+  done
+  rm -f "$seen_file"
+  echo
+}
 cmd_mock_diagnostics_chroot(){
-  local context="${1:-}" srpm_path="" candidate
+  local context="${1:-}" srpm_path="" transaction_path="" output_root="" candidate
 
   if (($#)); then
     shift
   fi
 
-  if [[ "${1:-}" == --srpm ]]; then
-    srpm_path="${2:-}"
-    shift 2 || true
-  fi
+  while (($#)); do
+    case "${1:-}" in
+      --srpm)
+        srpm_path="${2:-}"
+        shift 2
+        ;;
+      --transaction)
+        transaction_path="${2:-}"
+        shift 2
+        ;;
+      --output-root)
+        output_root="${2:-}"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
 
   set +e
 
@@ -1373,6 +1627,11 @@ cmd_mock_diagnostics_chroot(){
 
   if [[ -n "$srpm_path" ]]; then
     rpm_diagnostic_srpm_chroot "$srpm_path"
+    echo
+  fi
+
+  if [[ -n "$transaction_path" ]]; then
+    rpm_diagnostic_report_reverse_dependencies "$transaction_path" "$output_root"
     echo
   fi
 
@@ -1390,6 +1649,7 @@ cmd_mock_diagnostics_chroot(){
     echo "=== installed RPM scripts/triggers: $candidate ==="
     rpm_diagnostic_query_package -q "$candidate"
     echo
+    rpm_diagnostic_check_trigger_commands "$candidate"
 
     echo "=== cached RPM scripts/triggers: $candidate ==="
     rpm_diagnostic_query_cached_rpms_for_candidate "$candidate"
@@ -1399,10 +1659,12 @@ cmd_mock_diagnostics_chroot(){
 
 rpm_dump_mock_diagnostics(){
   local result="$1" target="$2" phase="$3" context="${4:-}" srpm="${5:-}" local_repo="${6:-}" lines="${MOCK_LOG_TAIL_LINES:-200}"
-  local mock_args=() log diagnostic_command quoted_value candidate bind_spec srpm_dir srpm_chroot_path
+  local mock_args=() log diagnostic_command quoted_value candidate bind_spec srpm_dir srpm_chroot_path transaction_file
 
   mkdir -p "$result"
   log="$result/chroot-diagnostics.log"
+  transaction_file="$result/transaction-packages.tsv"
+  rpm_diagnostic_transaction_packages_from_logs "$result" >"$transaction_file" || : >"$transaction_file"
   rpm_mock_args_array "$target" "$phase" mock_args
 
   if [[ -n "$local_repo" ]]; then
@@ -1412,7 +1674,12 @@ rpm_dump_mock_diagnostics(){
   printf -v quoted_value '%q' "$context"
   diagnostic_command="bash /tmp/publisher/repository_builder.sh mock-diagnostics-chroot $quoted_value"
 
-  bind_spec="[('$ROOT', '/tmp/publisher')"
+  bind_spec="[('$ROOT', '/tmp/publisher'),('$result', '/tmp/diagnostic-result')"
+
+  printf -v quoted_value '%q' /tmp/diagnostic-result/transaction-packages.tsv
+  diagnostic_command+=" --transaction $quoted_value"
+  printf -v quoted_value '%q' /tmp/diagnostic-result
+  diagnostic_command+=" --output-root $quoted_value"
 
   if [[ -n "$srpm" && -f "$srpm" ]]; then
     srpm_dir="$(dirname "$srpm")"
@@ -1424,6 +1691,7 @@ rpm_dump_mock_diagnostics(){
 
   bind_spec+="]"
 
+  diagnostic_command+=" --"
   while IFS= read -r candidate; do
     [[ -n "$candidate" ]] || continue
     printf -v quoted_value '%q' "$candidate"
@@ -1439,6 +1707,14 @@ rpm_dump_mock_diagnostics(){
     echo "local_repo=${local_repo:-}"
     echo
     rpm_diagnostic_transaction_sections_from_logs "$result"
+    rpm_diagnostic_scriptlet_failures_from_logs "$result"
+    echo "=== transaction package list ==="
+    if [[ -s "$transaction_file" ]]; then
+      cat "$transaction_file"
+    else
+      echo "none"
+    fi
+    echo
   } >"$log"
 
   if ! mock -r "$target" "${mock_args[@]}" \
@@ -1452,6 +1728,7 @@ rpm_dump_mock_diagnostics(){
   echo "--- chroot-diagnostics.log (last $lines lines) ---" >&2
   tail -n "$lines" "$log" >&2 || true
 }
+
 rpm_mock_args_array(){
   local target="$1" phase="$2" family arch
   local -n out_args="$3"
