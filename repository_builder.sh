@@ -10,6 +10,7 @@ PACKAGE_TYPES=" rpm deb flatpak "
 HOST_ENV_VARS=(PACKAGE_TYPE APP SOURCE_GIT BUILD_SCRIPT REPO_OWNER REPO_NAME FPR TARGETS)
 TRIMMED_ENV_VARS=" PACKAGE_TYPE REPO_OWNER REPO_NAME FPR TARGETS "
 CACHE_MOUNTS=("mock:/var/cache/mock")
+PACKAGE_CACHE_SCHEMA=1
 
 GPG_KEY_BATCH='%no-protection
 Key-Type: RSA
@@ -330,6 +331,59 @@ target_container_image(){
   fi
 }
 
+
+
+target_config_fingerprint_for_targets(){
+  local package_type="$1"
+  local target family arch config_file
+
+  {
+    printf 'cache_schema=%s\n' "$PACKAGE_CACHE_SCHEMA"
+    printf 'package_type=%s\n' "$package_type"
+
+    while IFS= read -r target; do
+      [[ -n "$target" ]] || continue
+      IFS=$'\t' read -r family arch < <(split_target "$target")
+      config_file="$(find_target_config "$package_type" "$family" "$arch")"
+
+      printf 'target=%s\n' "$target"
+      printf 'config=%s\n' "${config_file#$ROOT/}"
+      printf 'sha256=%s\n' "$(sha256_file "$config_file")"
+    done < <(targets_list)
+  } | sha256_lines
+}
+
+package_cache_key_for_targets(){
+  local package_type="$1"
+  local fingerprint
+
+  fingerprint="$(target_config_fingerprint_for_targets "$package_type")"
+  printf '%s-v%s-%s' "$package_type" "$PACKAGE_CACHE_SCHEMA" "${fingerprint:0:16}"
+}
+
+write_package_cache_manifest(){
+  local cache_root="$1"
+  local package_type="$2"
+  local target family arch config_file
+
+  mkdir -p "$cache_root"
+
+  {
+    printf 'cache_schema=%s\n' "$PACKAGE_CACHE_SCHEMA"
+    printf 'package_type=%s\n' "$package_type"
+    printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    while IFS= read -r target; do
+      [[ -n "$target" ]] || continue
+      IFS=$'\t' read -r family arch < <(split_target "$target")
+      config_file="$(find_target_config "$package_type" "$family" "$arch")"
+
+      printf 'target=%s\n' "$target"
+      printf 'config=%s\n' "${config_file#$ROOT/}"
+      printf 'sha256=%s\n' "$(sha256_file "$config_file")"
+    done < <(targets_list)
+  } >"$cache_root/.repository-builder-cache-manifest"
+}
 
 cached_builder_image(){
   local package_type="$1"
@@ -2193,7 +2247,7 @@ cmd_build_container(){
   fi
 
   local package_type="${PACKAGE_TYPE:?}"
-  local target family arch config_file config_fp
+  local target family arch
   local base_image=""
   local build_cmd=""
   local first_target=""
@@ -2231,27 +2285,10 @@ cmd_build_container(){
 
   image="$(cached_builder_image "$package_type" "$base_image" "$build_cmd")"
 
-  config_fp="$(
-    {
-      printf 'package_type=%s\n' "$package_type"
-      printf 'targets:\n'
-      targets_list
-      printf 'configs:\n'
-
-      while IFS= read -r target; do
-        [[ -n "$target" ]] || continue
-        IFS=$'\t' read -r family arch < <(split_target "$target")
-        config_file="$(find_target_config "$package_type" "$family" "$arch")"
-        printf 'target=%s\n' "$target"
-        printf 'config=%s\n' "${config_file#$ROOT/}"
-        printf 'sha256=%s\n' "$(sha256_file "$config_file")"
-      done < <(targets_list)
-    } | sha256_lines
-  )"
-
-  cache_key="$package_type-${config_fp:0:16}"
+  cache_key="$(package_cache_key_for_targets "$package_type")"
   cache_root="package-cache/$cache_key"
-  mkdir -p "$cache_root"
+  write_package_cache_manifest "$cache_root" "$package_type"
+  echo "Using package cache: $cache_root"
 
   for var in "${HOST_ENV_VARS[@]}"; do
     [[ -n "${!var+x}" ]] || continue
