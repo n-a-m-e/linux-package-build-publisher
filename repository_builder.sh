@@ -1074,7 +1074,7 @@ rpm_configure_signing(){
 EOF
 }
 rpm_dump_mock_failure(){
-  local dir="$1" msg="$2" lines="${MOCK_LOG_TAIL_LINES:-300}"
+  local dir="$1" msg="$2" lines="${MOCK_LOG_TAIL_LINES:-200}"
   local log found=0
 
   error "$msg"
@@ -1092,8 +1092,116 @@ rpm_dump_mock_failure(){
     echo "--- no mock result logs found in $dir ---" >&2
   fi
 }
+
+rpm_diagnostic_write_srpm_host(){
+  local result="$1" srpm="$2" log
+
+  [[ -n "$srpm" && -f "$srpm" ]] || return 0
+
+  mkdir -p "$result"
+  log="$result/srpm-buildrequires.log"
+
+  {
+    echo "=== SRPM ==="
+    echo "srpm=$srpm"
+    rpm -qp --queryformat 'name=%{NAME}\nversion=%{VERSION}\nrelease=%{RELEASE}\narch=%{ARCH}\n' "$srpm" 2>&1 || true
+    echo
+
+    echo "=== SRPM requires / BuildRequires ==="
+    rpm -qpR "$srpm" 2>&1 | sort -u || true
+    echo
+  } >"$log"
+
+  echo "--- ${log#$result/} ---" >&2
+  cat "$log" >&2 || true
+}
+
+rpm_diagnostic_transaction_sections_from_logs(){
+  local result="$1" log found=0
+
+  echo "=== package transaction sections from mock logs ==="
+
+  shopt -s nullglob
+  for log in "$result"/*.log "$result"/*/*.log; do
+    [[ -f "$log" ]] || continue
+    found=1
+    echo "--- ${log#$result/} ---"
+    awk '
+      /^(Installing|Installing dependencies|Installing weak dependencies|Installing group\/module packages|Upgrading|Downgrading|Reinstalling|Removing):[[:space:]]*$/ {
+        section=$0
+        sub(/:[[:space:]]*$/, "", section)
+        print "[" section "]"
+        next
+      }
+      /^(Transaction Summary|Running transaction check|Running transaction test|Running transaction|Complete!|Error:)/ {
+        section=""
+      }
+      section && /^[[:space:]]+[A-Za-z0-9_.:+-]+[[:space:]]/ {
+        name=$1
+        if (name !~ /^(Package|Arch|Version|Repository|Size)$/) {
+          print section "\t" name
+        }
+      }
+    ' "$log" || true
+  done
+  shopt -u nullglob
+
+  if ! ((found)); then
+    echo "no mock logs found"
+  fi
+  echo
+}
+
+rpm_diagnostic_repoquery_whatprovides(){
+  local requirement="$1"
+
+  if command -v dnf5 >/dev/null 2>&1; then
+    dnf5 -q repoquery --whatprovides "$requirement" --queryformat '%{name}-%{evr}.%{arch}' 2>&1 \
+      || dnf5 -q repoquery --whatprovides "$requirement" 2>&1 \
+      || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf -q repoquery --whatprovides "$requirement" --qf '%{name}-%{evr}.%{arch}' 2>&1 \
+      || dnf -q repoquery --whatprovides "$requirement" 2>&1 \
+      || true
+  elif command -v repoquery >/dev/null 2>&1; then
+    repoquery --whatprovides "$requirement" 2>&1 || true
+  else
+    echo "no repoquery-capable command is available"
+  fi
+}
+
+rpm_diagnostic_srpm_chroot(){
+  local srpm="$1" requirement count=0 limit="${MOCK_DIAGNOSTIC_REQUIREMENT_LIMIT:-300}"
+
+  echo "=== SRPM requires / BuildRequires inside chroot ==="
+  if [[ ! -f "$srpm" ]]; then
+    echo "SRPM is not readable inside chroot: $srpm"
+    echo
+    return 0
+  fi
+
+  rpm -qpR "$srpm" 2>&1 | sort -u || true
+  echo
+
+  echo "=== provider lookup for SRPM requirements ==="
+  rpm -qpR "$srpm" 2>/dev/null | sort -u | while IFS= read -r requirement; do
+    [[ -n "$requirement" ]] || continue
+    count=$((count + 1))
+    if ((count > limit)); then
+      echo "provider lookup stopped after $limit requirements"
+      break
+    fi
+
+    echo "--- requirement: $requirement ---"
+    rpm_diagnostic_repoquery_whatprovides "$requirement" | sed '/^[[:space:]]*$/d' | sort -u || true
+    echo
+  done
+}
+
 rpm_diagnostic_trigger_options(){
   printf '%s\n' \
+    --scripts \
+    --triggers \
     --filetriggers \
     --filetriggerin \
     --filetriggerun \
@@ -1106,14 +1214,8 @@ rpm_diagnostic_trigger_options(){
 rpm_diagnostic_query_package(){
   local mode="$1" package="$2" option
 
-  echo "--- $mode $package scripts ---"
-  rpm "$mode" --scripts "$package" 2>&1 || true
-
-  echo "--- $mode $package triggers ---"
-  rpm "$mode" --triggers "$package" 2>&1 || true
-
   while IFS= read -r option; do
-    echo "--- $mode $package $option ---"
+    echo "--- rpm $mode $option $package ---"
     rpm "$mode" "$option" "$package" 2>&1 || true
   done < <(rpm_diagnostic_trigger_options)
 }
@@ -1150,24 +1252,25 @@ rpm_diagnostic_base_candidate(){
 }
 
 rpm_diagnostic_query_cached_rpms_for_candidate(){
-  local candidate="$1" base dir rpm_file found=0
+  local candidate="$1" base dir rpm_file found=0 count=0 limit="${MOCK_DIAGNOSTIC_CACHED_RPM_LIMIT:-5}"
 
   base="$(rpm_diagnostic_base_candidate "$candidate")"
 
-  echo "=== cached RPM metadata for candidate: $candidate ==="
   while IFS= read -r dir; do
     for rpm_file in "$dir"/"$candidate"*.rpm "$dir"/"$base"-*.rpm; do
       [[ -f "$rpm_file" ]] || continue
       found=1
+      count=$((count + 1))
+      ((count <= limit)) || return 0
 
-      echo "--- cached RPM: $rpm_file ---"
+      echo "=== cached RPM metadata: $rpm_file ==="
       rpm -qp --queryformat 'name=%{NAME}\nversion=%{VERSION}\nrelease=%{RELEASE}\narch=%{ARCH}\n' "$rpm_file" 2>&1 || true
       rpm_diagnostic_query_package -qp "$rpm_file"
+      echo
     done
   done < <(rpm_diagnostic_cached_dirs)
 
   ((found)) || echo "no cached RPM matched candidate: $candidate"
-  echo
 }
 
 rpm_diagnostic_candidates_from_logs(){
@@ -1186,7 +1289,7 @@ rpm_diagnostic_candidates_from_logs(){
           ;;
       esac
 
-      while [[ "$line" =~ %[^\(]+\(([^\)]+)\) ]]; do
+      while [[ "$line" =~ %[A-Za-z0-9_]+\(([^\)]+)\) ]]; do
         candidate="${BASH_REMATCH[1]}"
         printf '%s\n' "$candidate"
         line="${line#*${BASH_REMATCH[0]}}"
@@ -1197,104 +1300,75 @@ rpm_diagnostic_candidates_from_logs(){
 }
 
 cmd_mock_diagnostics_chroot(){
-  local context="${1:-}" command option candidate
+  local context="${1:-}" srpm_path="" candidate
 
   if (($#)); then
     shift
   fi
 
-  set +e
+  if [[ "${1:-}" == --srpm ]]; then
+    srpm_path="${2:-}"
+    shift 2 || true
+  fi
 
-  echo "=== repository-builder mock diagnostics ==="
-  date 2>/dev/null || true
-  echo
+  set +e
 
   echo "=== diagnostic context ==="
   echo "$context"
   echo
 
-  echo "=== os-release ==="
-  if [[ -r /etc/os-release ]]; then
-    while IFS= read -r line; do
-      echo "$line"
-    done </etc/os-release
-  else
-    echo "/etc/os-release is not readable"
+  if [[ -n "$srpm_path" ]]; then
+    rpm_diagnostic_srpm_chroot "$srpm_path"
+    echo
   fi
-  echo
 
-  echo "=== command availability ==="
-  for command in bash sh find cat sed grep awk rpm dnf dnf5 microdnf systemctl lua; do
-    printf '%s: ' "$command"
-    command -v "$command" 2>/dev/null || echo missing
-  done
-  echo
-
-  echo "=== rpm trigger query support ==="
-  local rpm_help
-  rpm_help="$(rpm --help 2>&1)"
-
-  for option in --scripts --triggers; do
-    printf '%s: ' "$option"
-    if [[ "$rpm_help" == *"$option"* ]]; then
-      echo supported
-    else
-      echo unknown
-    fi
-  done
-
-  while IFS= read -r option; do
-    printf '%s: ' "$option"
-    if [[ "$rpm_help" == *"$option"* ]]; then
-      echo supported
-    else
-      echo unknown
-    fi
-  done < <(rpm_diagnostic_trigger_options)
-  echo
-
-  echo "=== diagnostic package candidates from mock logs ==="
+  echo "=== script/trigger candidates from mock logs ==="
   if (($#)); then
     printf '%s\n' "$@"
   else
-    echo "no package candidates were extracted from mock logs"
+    echo "none"
   fi
   echo
 
   for candidate in "$@"; do
     [[ -n "$candidate" ]] || continue
 
-    echo "=== installed RPM metadata for candidate: $candidate ==="
+    echo "=== installed RPM scripts/triggers: $candidate ==="
     rpm_diagnostic_query_package -q "$candidate"
     echo
 
+    echo "=== cached RPM scripts/triggers: $candidate ==="
     rpm_diagnostic_query_cached_rpms_for_candidate "$candidate"
-  done
-
-  echo "=== dnf/libdnf/zypp cached package directories ==="
-  rpm_diagnostic_cached_dirs || true
-  echo
-
-  echo "=== recent rpm database entries ==="
-  rpm -qa --last 2>&1 | head -80 || true
-  echo
-
-  echo "=== script and trigger metadata for recent installed packages ==="
-  rpm -qa --last 2>/dev/null | head -${MOCK_DIAGNOSTIC_RECENT_PACKAGE_LIMIT:-30} | while IFS= read -r package _; do
-    [[ -n "$package" ]] || continue
-    rpm_diagnostic_query_package -q "$package"
     echo
-  done || true
+  done
 }
+
 rpm_dump_mock_diagnostics(){
-  local result="$1" target="$2" phase="$3" context="${4:-}" lines="${MOCK_LOG_TAIL_LINES:-300}"
-  local mock_args=() log diagnostic_command quoted_value candidate
+  local result="$1" target="$2" phase="$3" context="${4:-}" srpm="${5:-}" local_repo="${6:-}" lines="${MOCK_LOG_TAIL_LINES:-200}"
+  local mock_args=() log diagnostic_command quoted_value candidate bind_spec srpm_dir srpm_chroot_path
 
   mkdir -p "$result"
   log="$result/chroot-diagnostics.log"
   rpm_mock_args_array "$target" "$phase" mock_args
+
+  if [[ -n "$local_repo" ]]; then
+    mock_args+=(--addrepo "file://$local_repo")
+  fi
+
   printf -v quoted_value '%q' "$context"
   diagnostic_command="bash /tmp/publisher/repository_builder.sh mock-diagnostics-chroot $quoted_value"
+
+  bind_spec="[('$ROOT', '/tmp/publisher')"
+
+  if [[ -n "$srpm" && -f "$srpm" ]]; then
+    srpm_dir="$(dirname "$srpm")"
+    srpm_chroot_path="/tmp/diagnostic-srpm/$(basename "$srpm")"
+    bind_spec+=",('$srpm_dir', '/tmp/diagnostic-srpm')"
+    printf -v quoted_value '%q' "$srpm_chroot_path"
+    diagnostic_command+=" --srpm $quoted_value"
+  fi
+
+  bind_spec+="]"
 
   while IFS= read -r candidate; do
     [[ -n "$candidate" ]] || continue
@@ -1307,12 +1381,15 @@ rpm_dump_mock_diagnostics(){
     echo "target=$target"
     echo "phase=$phase"
     echo "message=$context"
+    echo "srpm=${srpm:-}"
+    echo "local_repo=${local_repo:-}"
     echo
+    rpm_diagnostic_transaction_sections_from_logs "$result"
   } >"$log"
 
   if ! mock -r "$target" "${mock_args[@]}" \
     --enable-plugin bind_mount \
-    --plugin-option "bind_mount:dirs=[('$ROOT', '/tmp/publisher')]" \
+    --plugin-option "bind_mount:dirs=$bind_spec" \
     --chroot "$diagnostic_command" >>"$log" 2>&1;
   then
     echo "=== unable to run mock diagnostics inside chroot ===" >>"$log"
@@ -1355,7 +1432,7 @@ rpm_mock_with_args(){
   fi
 
   rpm_dump_mock_failure "$result" "$msg"
-  rpm_dump_mock_diagnostics "$result" "$target" "$phase" "$msg"
+  rpm_dump_mock_diagnostics "$result" "$target" "$phase" "$msg" "${RPM_DIAGNOSTIC_SRPM:-}" "${RPM_DIAGNOSTIC_LOCAL_REPO:-}"
   die "$msg"
 }
 rpm_mock_out_with_binds(){
@@ -1390,7 +1467,7 @@ rpm_mock_out_with_binds(){
   printf '%s
 ' "$out" >&2
   rpm_dump_mock_failure "$result" "$msg"
-  rpm_dump_mock_diagnostics "$result" "$target" "$phase" "$msg"
+  rpm_dump_mock_diagnostics "$result" "$target" "$phase" "$msg" "${RPM_DIAGNOSTIC_SRPM:-}" "${RPM_DIAGNOSTIC_LOCAL_REPO:-}"
   die "$msg"
 }
 rpm_prepare_effective(){
@@ -1457,9 +1534,13 @@ rpm_rebuild(){
   dep_args=("${common_args[@]}" --installdeps "$srpm")
   rebuild_args=("${common_args[@]}" --rebuild "$srpm")
 
+  rpm_diagnostic_write_srpm_host "$result" "$srpm"
+
   rpm_mock_with_args "$result" "mock init failed for $target" "$target" build --init
-  rpm_mock_with_args "$result" "mock build dependency install failed for $(basename "$srpm")" "$target" build "${dep_args[@]}"
-  rpm_mock_with_args "$result" "mock rebuild failed for $(basename "$srpm")" "$target" build "${rebuild_args[@]}"
+  RPM_DIAGNOSTIC_SRPM="$srpm" RPM_DIAGNOSTIC_LOCAL_REPO="$local_repo" \
+    rpm_mock_with_args "$result" "mock build dependency install failed for $(basename "$srpm")" "$target" build "${dep_args[@]}"
+  RPM_DIAGNOSTIC_SRPM="$srpm" RPM_DIAGNOSTIC_LOCAL_REPO="$local_repo" \
+    rpm_mock_with_args "$result" "mock rebuild failed for $(basename "$srpm")" "$target" build "${rebuild_args[@]}"
 }
 rpm_copy_one(){
   local file="$1" repo="$2" source_repo="$3" local_repo="$4"
