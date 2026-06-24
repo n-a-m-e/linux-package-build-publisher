@@ -469,6 +469,36 @@ rpm_stepwise_buildrequires_failure_report(){
   } >>"$log" 2>&1 || true
 }
 
+
+rpm_finalize_stepwise_buildroot(){
+  local result="$1" target="$2" log="$3"
+  shift 3
+
+  local mock_args=("$@") status
+  local finalize_cmd='if command -v ldconfig >/dev/null 2>&1; then ldconfig; else echo "ldconfig not available; skipping"; fi'
+
+  {
+    echo
+    echo "=== finalise buildroot after BuildRequires installs ==="
+    echo "reason=BuildRequires were installed with scriptlets/triggers suppressed; refresh generic runtime linker state before rebuild"
+    echo "command=$finalize_cmd"
+  } | tee -a "$log" >&2
+
+  if mock -r "$target" "${mock_args[@]}" --chroot "$finalize_cmd" >>"$log" 2>&1; then
+    {
+      echo "status=buildroot-finalised"
+    } >>"$log"
+  else
+    status=$?
+    {
+      echo "status=buildroot-finalise-warning"
+      echo "exit_status=$status"
+      echo "continuing=true"
+    } >>"$log"
+    echo "warning: buildroot finalisation command exited with status $status; continuing to rebuild" >&2
+  fi
+}
+
 rpm_install_buildrequires_stepwise(){
   local result="$1" msg="$2" target="$3" phase="$4" spec_path="$5" url="$6"
   shift 6
@@ -545,6 +575,8 @@ rpm_install_buildrequires_stepwise(){
     echo
     echo "=== all BuildRequires entries installed successfully ==="
   } >>"$log"
+
+  rpm_finalize_stepwise_buildroot "$result" "$target" "$log" "${mock_args[@]}"
 }
 
 rpm_build_srpm(){
