@@ -96,6 +96,7 @@ rpm_diagnostic_parse_transaction_logs(){
         row = line
         sub(/^[[:space:]]+/, "", row)
         if (row == "" || row ~ /^=+$/ || row ~ /^Package[[:space:]]+Arch[[:space:]]+/) next
+        if (row ~ /^(error:|Error[[:space:]]|Warning:|warning:|DEBUG[[:space:]]|INFO[[:space:]])/) next
         split(row, fields, /[[:space:]]+/)
         name = fields[1]
         if (name != "" && name !~ /^(Package|Arch|Version|Repository|Size|\[SKIPPED\])$/) {
@@ -137,13 +138,13 @@ rpm_diagnostic_scriptlet_failures_from_logs(){
     while IFS= read -r line; do
       if [[ "$line" =~ %([A-Za-z0-9_]+)\(([^\)]+)\) ]]; then
         owner="${BASH_REMATCH[1]}(${BASH_REMATCH[2]})"
-        echo "trigger_owner\t$owner"
+        printf 'trigger_owner\t%s\n' "$owner"
       fi
       case "$line" in
         *'scriptlet in rpm package '*)
           active="${line#*scriptlet in rpm package }"
           active="${active%%[[:space:]:,;]*}"
-          echo "active_package\t$active"
+          printf 'active_package\t%s\n' "$active"
           ;;
       esac
     done <"$log"
@@ -541,11 +542,47 @@ cmd_mock_diagnostics_chroot(){
 rpm_dump_mock_diagnostics(){
   local result="$1" target="$2" phase="$3" context="${4:-}" srpm="${5:-}" local_repo="${6:-}" lines="${MOCK_LOG_TAIL_LINES:-200}"
   local mock_args=() log diagnostic_command quoted_value candidate bind_spec srpm_dir srpm_chroot_path transaction_file
+  local deep_enabled="${RPM_DEEP_DIAGNOSTICS:-${MOCK_DEEP_DIAGNOSTICS:-0}}" timeout_duration="${RPM_DIAGNOSTIC_TIMEOUT:-${MOCK_DIAGNOSTIC_TIMEOUT:-45s}}"
+  local status=0
 
   mkdir -p "$result"
   log="$result/chroot-diagnostics.log"
   transaction_file="$result/transaction-packages.tsv"
   rpm_diagnostic_transaction_packages_from_logs "$result" >"$transaction_file" || : >"$transaction_file"
+
+  {
+    echo "=== diagnostic context ==="
+    echo "target=$target"
+    echo "phase=$phase"
+    echo "message=$context"
+    echo "srpm=${srpm:-}"
+    echo "local_repo=${local_repo:-}"
+    echo
+    rpm_diagnostic_transaction_sections_from_logs "$result"
+    rpm_diagnostic_scriptlet_failures_from_logs "$result"
+    echo "=== transaction package list ==="
+    if [[ -s "$transaction_file" ]]; then
+      cat "$transaction_file"
+    else
+      echo "none"
+    fi
+    echo
+  } >"$log"
+
+  if ! diagnostics_bool_enabled "$deep_enabled"; then
+    {
+      echo "=== deep mock chroot diagnostics skipped ==="
+      echo "RPM_DEEP_DIAGNOSTICS is not enabled, so diagnostics were limited to existing mock logs."
+      echo "Set RPM_DEEP_DIAGNOSTICS=1 to run the extra mock --chroot probe."
+      echo "The deep probe is timeout-protected by RPM_DIAGNOSTIC_TIMEOUT=${timeout_duration}."
+      echo
+    } >>"$log"
+
+    echo "--- chroot-diagnostics.log (last $lines lines) ---" >&2
+    tail -n "$lines" "$log" >&2 || true
+    return 0
+  fi
+
   rpm_mock_args_array "$target" "$phase" mock_args
 
   if [[ -n "$local_repo" ]]; then
@@ -580,31 +617,29 @@ rpm_dump_mock_diagnostics(){
   done < <(rpm_diagnostic_candidates_from_logs "$result")
 
   {
-    echo "=== diagnostic context ==="
-    echo "target=$target"
-    echo "phase=$phase"
-    echo "message=$context"
-    echo "srpm=${srpm:-}"
-    echo "local_repo=${local_repo:-}"
+    echo "=== running deep mock chroot diagnostics ==="
+    echo "timeout=$timeout_duration"
+    echo "The deep probe is optional and will be stopped if it exceeds the timeout."
     echo
-    rpm_diagnostic_transaction_sections_from_logs "$result"
-    rpm_diagnostic_scriptlet_failures_from_logs "$result"
-    echo "=== transaction package list ==="
-    if [[ -s "$transaction_file" ]]; then
-      cat "$transaction_file"
-    else
-      echo "none"
-    fi
-    echo
-  } >"$log"
+  } >>"$log"
+  echo "Running RPM deep diagnostics with timeout $timeout_duration ..." >&2
 
-  if ! mock -r "$target" "${mock_args[@]}" \
-    --enable-plugin bind_mount \
-    --plugin-option "bind_mount:dirs=$bind_spec" \
-    --chroot "$diagnostic_command" >>"$log" 2>&1;
-  then
-    echo "=== unable to run mock diagnostics inside chroot ===" >>"$log"
-  fi
+  diagnostics_run_with_timeout "$timeout_duration" "$log"     mock -r "$target" "${mock_args[@]}"       --enable-plugin bind_mount       --plugin-option "bind_mount:dirs=$bind_spec"       --chroot "$diagnostic_command" || status=$?
+
+  case "$status" in
+    0)
+      ;;
+    124|137)
+      echo "RPM deep diagnostics timed out after $timeout_duration; continuing with collected diagnostics." >&2
+      ;;
+    125)
+      echo "RPM deep diagnostics skipped because timeout support is unavailable." >&2
+      ;;
+    *)
+      echo "=== unable to run mock diagnostics inside chroot ===" >>"$log"
+      echo "exit_status=$status" >>"$log"
+      ;;
+  esac
 
   echo "--- chroot-diagnostics.log (last $lines lines) ---" >&2
   tail -n "$lines" "$log" >&2 || true
