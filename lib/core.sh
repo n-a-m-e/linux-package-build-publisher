@@ -120,9 +120,6 @@ main(){
     rpm-list-sources-chroot)
       cmd_rpm_list_sources_chroot "$@"
       ;;
-    mock-diagnostics-chroot)
-      cmd_mock_diagnostics_chroot "$@"
-      ;;
     *)
       die "Unknown builder command: $cmd"
       ;;
