@@ -445,7 +445,6 @@ rpm_buildrequires_from_srpm(){
   ' >"$tmp"
 
   mv "$tmp" "$output"
-  [[ -s "$output" ]] || die "No BuildRequires entries found in SRPM metadata: $srpm"
 }
 
 rpm_stepwise_buildrequires_failure_report(){
@@ -523,9 +522,22 @@ rpm_install_buildrequires_stepwise(){
     echo "target_args=${target_args[*]}"
     echo "common_args=${common_args[*]}"
     echo
-    sed 's/^/  /' "$deps_file"
+    if [[ "$total" -gt 0 ]]; then
+      sed 's/^/  /' "$deps_file"
+    else
+      echo "  no BuildRequires entries found in SRPM metadata after filtering internal rpmlib capabilities"
+    fi
     echo
   } >"$log"
+
+  if [[ "$total" -eq 0 ]]; then
+    {
+      echo "=== no BuildRequires entries ==="
+      echo "status=skipped-stepwise-install"
+      echo "reason=SRPM has no real BuildRequires after filtering rpmlib capabilities"
+    } | tee -a "$log" >&2
+    return 0
+  fi
 
   index=0
   while IFS= read -r dep; do
