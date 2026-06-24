@@ -418,44 +418,34 @@ rpm_prepare_effective(){
 }
 
 
-rpm_buildrequires_from_spec(){
-  local spec_path="$1" url="${2:-}" output="$3"
-  local expanded tmp
+rpm_buildrequires_from_srpm(){
+  local srpm="$1" output="$2"
+  local tmp
 
-  [[ -f "$spec_path" ]] || die "Missing spec for BuildRequires parsing: $spec_path"
+  [[ -f "$srpm" ]] || die "Missing SRPM for BuildRequires parsing: $srpm"
   mkdir -p "$(dirname "$output")"
-
-  expanded="$output.expanded"
   tmp="$output.tmp"
 
-  if [[ -n "$url" ]]; then
-    rpmspec --define "url $url" -P "$spec_path" >"$expanded"
-  else
-    rpmspec -P "$spec_path" >"$expanded"
-  fi
-
-  awk '
+  # For source RPMs, the RPM requires metadata contains the resolved
+  # BuildRequires set. Reading the built SRPM avoids expanding the raw spec in
+  # the host/container macro context, which can miss target macros such as
+  # distro-specific library macros.
+  rpm -qp --requires "$srpm" | awk '
     function trim(s) {
       sub(/^[[:space:]]+/, "", s)
       sub(/[[:space:]]+$/, "", s)
       return s
     }
-    /^[[:space:]]*BuildRequires:[[:space:]]*/ {
-      line = $0
-      sub(/^[[:space:]]*BuildRequires:[[:space:]]*/, "", line)
-      sub(/[[:space:]]+#.*$/, "", line)
-      n = split(line, deps, /,[[:space:]]*/)
-      for (i = 1; i <= n; i++) {
-        dep = trim(deps[i])
-        if (dep != "" && !seen[dep]++) print dep
-      }
+    {
+      dep = trim($0)
+      if (dep == "") next
+      if (dep ~ /^rpmlib\(/) next
+      if (!seen[dep]++) print dep
     }
-  ' "$expanded" >"$tmp"
+  ' >"$tmp"
 
   mv "$tmp" "$output"
-  rm -f "$expanded"
-
-  [[ -s "$output" ]] || die "No BuildRequires entries found in expanded spec: $spec_path"
+  [[ -s "$output" ]] || die "No BuildRequires entries found in SRPM metadata: $srpm"
 }
 
 rpm_stepwise_buildrequires_failure_report(){
@@ -500,8 +490,8 @@ rpm_finalize_stepwise_buildroot(){
 }
 
 rpm_install_buildrequires_stepwise(){
-  local result="$1" msg="$2" target="$3" phase="$4" spec_path="$5" url="$6"
-  shift 6
+  local result="$1" msg="$2" target="$3" phase="$4" srpm="$5"
+  shift 5
 
   local common_args=("$@") target_args=() mock_args=()
   local deps_file log dep status index total
@@ -511,7 +501,7 @@ rpm_install_buildrequires_stepwise(){
   deps_file="$result/stepwise-buildrequires.txt"
   log="$result/stepwise-buildrequires.log"
 
-  rpm_buildrequires_from_spec "$spec_path" "$url" "$deps_file"
+  rpm_buildrequires_from_srpm "$srpm" "$deps_file"
   total="$(awk 'NF { count++ } END { print count + 0 }' "$deps_file")"
 
   # The stepwise dependency installs must use the exact same mock root and
@@ -526,8 +516,7 @@ rpm_install_buildrequires_stepwise(){
     echo "=== stepwise BuildRequires installation ==="
     echo "target=$target"
     echo "phase=$phase"
-    echo "spec=$spec_path"
-    [[ -n "$url" ]] && echo "url=$url"
+    echo "srpm=$srpm"
     echo "dependencies=$deps_file"
     echo "count=$total"
     echo "strategy=mock --pm-cmd install ${install_flags[*]} <BuildRequires-entry>"
@@ -623,8 +612,7 @@ rpm_rebuild(){
     "mock build dependency install failed for $(basename "$srpm")" \
     "$target" \
     build \
-    "$spec_path" \
-    "$url" \
+    "$srpm" \
     "${common_args[@]}"
 
   rpm_mock_with_args "$result" "mock rebuild failed for $(basename "$srpm")" "$target" build "${rebuild_args[@]}"
