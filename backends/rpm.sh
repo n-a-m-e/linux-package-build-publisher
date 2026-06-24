@@ -475,6 +475,7 @@ rpm_install_buildrequires_stepwise(){
 
   local common_args=("$@") target_args=() mock_args=()
   local deps_file log dep status index total
+  local install_flags=(-y --setopt=tsflags=noscripts,notriggers)
 
   mkdir -p "$result"
   deps_file="$result/stepwise-buildrequires.txt"
@@ -499,7 +500,7 @@ rpm_install_buildrequires_stepwise(){
     [[ -n "$url" ]] && echo "url=$url"
     echo "dependencies=$deps_file"
     echo "count=$total"
-    echo "strategy=mock --pm-cmd install -y <BuildRequires-entry>"
+    echo "strategy=mock --pm-cmd install ${install_flags[*]} <BuildRequires-entry>"
     echo "target_args=${target_args[*]}"
     echo "common_args=${common_args[*]}"
     echo
@@ -516,10 +517,10 @@ rpm_install_buildrequires_stepwise(){
       echo
       echo "=== BuildRequires $index/$total ==="
       echo "dependency=$dep"
-      echo "mock -r $target ... --pm-cmd install -y $dep"
+      echo "mock -r $target ... --pm-cmd install ${install_flags[*]} $dep"
     } | tee -a "$log" >&2
 
-    if mock -r "$target" "${mock_args[@]}" --pm-cmd install -y "$dep" >>"$log" 2>&1; then
+    if mock -r "$target" "${mock_args[@]}" --pm-cmd install "${install_flags[@]}" "$dep" >>"$log" 2>&1; then
       {
         echo "status=installed"
       } >>"$log"
