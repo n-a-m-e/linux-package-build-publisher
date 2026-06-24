@@ -247,7 +247,7 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
     status=$?
     {
       echo
-      echo "=== unable to re-init mock root for direct provider dry-runs ==="
+      echo "=== unable to re-init mock root for direct provider transaction tests ==="
       echo "exit_status=$status"
       echo
     } >>"$log"
@@ -258,7 +258,7 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
 
   {
     echo
-    echo "=== dry-run package-manager install for each direct builddep provider ==="
+    echo "=== transaction-test package-manager install for each direct builddep provider ==="
   } >>"$log"
 
   while IFS= read -r provider; do
@@ -266,21 +266,21 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
     found=1
     {
       echo
-      echo "--- mock --pm-cmd install -y --assumeno $provider ---"
+      echo "--- mock --pm-cmd install -y --setopt=tsflags=test $provider ---"
     } >>"$log"
 
     # Use mock's package-manager interface instead of running dnf inside
     # the chroot. Some mock roots do not contain /usr/bin/dnf, while
     # mock itself can still drive the configured package manager with the
     # buildroot as the installroot.
-    mock -r "$target" "${mock_args[@]}" --pm-cmd install -y --assumeno "$provider" >>"$log" 2>&1 || {
+    mock -r "$target" "${mock_args[@]}" --pm-cmd install -y --setopt=tsflags=test "$provider" >>"$log" 2>&1 || {
       status=$?
-      echo "mock --pm-cmd dry-run exited with status $status" >>"$log"
+      echo "mock --pm-cmd transaction test exited with status $status" >>"$log"
     }
   done < <(rpm_diagnostic_direct_installing_packages_from_logs "$result")
 
   if ! ((found)); then
-    echo "no direct builddep providers were available for dry-run diagnostics" >>"$log"
+    echo "no direct builddep providers were available for transaction-test diagnostics" >>"$log"
   fi
 
   echo "--- ${log#$result/} ---" >&2
