@@ -211,7 +211,7 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
   local result="$1" target="$2" phase="$3" msg="$4" srpm="$5" local_repo="$6"
   shift 6
 
-  local mock_args=("$@") log provider status found=0 quoted_provider
+  local mock_args=("$@") log provider status found=0
 
   mkdir -p "$result"
   log="$result/direct-builddep-provider-diagnostics.log"
@@ -258,22 +258,24 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
 
   {
     echo
-    echo "=== dry-run DNF install for each direct builddep provider ==="
+    echo "=== dry-run package-manager install for each direct builddep provider ==="
   } >>"$log"
 
   while IFS= read -r provider; do
     [[ -n "$provider" ]] || continue
     found=1
-    printf -v quoted_provider '%q' "$provider"
-
     {
       echo
-      echo "--- dnf -y --assumeno install $provider ---"
+      echo "--- mock --pm-cmd install -y --assumeno $provider ---"
     } >>"$log"
 
-    mock -r "$target" "${mock_args[@]}" --chroot "dnf -y --assumeno install $quoted_provider" >>"$log" 2>&1 || {
+    # Use mock's package-manager interface instead of running dnf inside
+    # the chroot. Some mock roots do not contain /usr/bin/dnf, while
+    # mock itself can still drive the configured package manager with the
+    # buildroot as the installroot.
+    mock -r "$target" "${mock_args[@]}" --pm-cmd install -y --assumeno "$provider" >>"$log" 2>&1 || {
       status=$?
-      echo "dnf dry-run exited with status $status" >>"$log"
+      echo "mock --pm-cmd dry-run exited with status $status" >>"$log"
     }
   done < <(rpm_diagnostic_direct_installing_packages_from_logs "$result")
 
