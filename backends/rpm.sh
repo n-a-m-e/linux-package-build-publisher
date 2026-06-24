@@ -458,56 +458,6 @@ rpm_buildrequires_from_spec(){
   [[ -s "$output" ]] || die "No BuildRequires entries found in expanded spec: $spec_path"
 }
 
-rpm_write_single_buildrequires_probe_spec(){
-  local dep="$1" spec_file="$2" index="$3"
-
-  cat >"$spec_file" <<EOF
-Name: repository-builder-buildrequire-$index
-Version: 1
-Release: 1
-Summary: Temporary BuildRequires probe for repository builder
-License: MIT
-BuildArch: noarch
-BuildRequires: $dep
-
-%description
-Temporary source package used to install one BuildRequires entry at a time.
-EOF
-}
-
-rpm_build_single_buildrequires_srpm(){
-  local result="$1" dep="$2" index="$3" out_var="$4"
-  local safe_index topdir specdir srpmdir builddir rpmdir sourcedir spec_file srpm
-
-  safe_index="$(printf '%04d' "$index")"
-  topdir="$result/stepwise-buildrequires-srpms/$safe_index"
-  specdir="$topdir/SPECS"
-  srpmdir="$topdir/SRPMS"
-  builddir="$topdir/BUILD"
-  rpmdir="$topdir/RPMS"
-  sourcedir="$topdir/SOURCES"
-
-  fresh_dir "$topdir"
-  mkdir -p "$specdir" "$srpmdir" "$builddir" "$rpmdir" "$sourcedir"
-
-  spec_file="$specdir/repository-builder-buildrequire-$safe_index.spec"
-  rpm_write_single_buildrequires_probe_spec "$dep" "$spec_file" "$safe_index"
-
-  rpmbuild -bs --nodeps \
-    --define "_topdir $topdir" \
-    --define "_specdir $specdir" \
-    --define "_sourcedir $sourcedir" \
-    --define "_srcrpmdir $srpmdir" \
-    --define "_builddir $builddir" \
-    --define "_rpmdir $rpmdir" \
-    "$spec_file" >/dev/null
-
-  srpm="$(find "$srpmdir" -maxdepth 1 -name '*.src.rpm' -print -quit)"
-  [[ -n "$srpm" ]] || die "Failed to create temporary BuildRequires SRPM for dependency: $dep"
-
-  printf -v "$out_var" '%s' "$srpm"
-}
-
 rpm_stepwise_buildrequires_failure_report(){
   local result="$1" log="$2"
 
@@ -523,7 +473,7 @@ rpm_install_buildrequires_stepwise(){
   local result="$1" msg="$2" target="$3" phase="$4" spec_path="$5" url="$6"
   shift 6
 
-  local mock_args=("$@") deps_file log dep dep_srpm status index total
+  local mock_args=("$@") deps_file log dep status index total
 
   mkdir -p "$result"
   deps_file="$result/stepwise-buildrequires.txt"
@@ -540,6 +490,7 @@ rpm_install_buildrequires_stepwise(){
     [[ -n "$url" ]] && echo "url=$url"
     echo "dependencies=$deps_file"
     echo "count=$total"
+    echo "strategy=mock --pm-cmd install -y <BuildRequires-entry>"
     echo
     sed 's/^/  /' "$deps_file"
     echo
@@ -554,35 +505,19 @@ rpm_install_buildrequires_stepwise(){
       echo
       echo "=== BuildRequires $index/$total ==="
       echo "dependency=$dep"
+      echo "mock -r $target ... --pm-cmd install -y $dep"
     } | tee -a "$log" >&2
 
-    if rpm_build_single_buildrequires_srpm "$result" "$dep" "$index" dep_srpm >>"$log" 2>&1; then
-      :
-    else
-      status=$?
+    if mock -r "$target" "${mock_args[@]}" --pm-cmd install -y "$dep" >>"$log" 2>&1; then
       {
-        echo "failed to create temporary BuildRequires SRPM"
-        echo "exit_status=$status"
+        echo "status=installed"
       } >>"$log"
-      echo "--- ${log#$result/} ---" >&2
-      cat "$log" >&2 || true
-      die "Failed to prepare one-at-a-time BuildRequires install for dependency: $dep"
-    fi
-
-    {
-      echo "temporary_srpm=$dep_srpm"
-      echo "mock -r $target ... --installdeps $dep_srpm"
-    } >>"$log"
-
-    if mock -r "$target" "${mock_args[@]}" --installdeps "$dep_srpm" >>"$log" 2>&1; then
-      :
     else
       status=$?
       {
         echo
         echo "=== failed BuildRequires dependency ==="
         echo "dependency=$dep"
-        echo "temporary_srpm=$dep_srpm"
         echo "exit_status=$status"
       } >>"$log"
 
@@ -634,7 +569,7 @@ rpm_rebuild(){
   )
   [[ -n "$url" ]] && common_args+=(--define "url $url")
 
-  rebuild_args=("${common_args[@]}" --rebuild "$srpm")
+  rebuild_args=("${common_args[@]}" --no-clean --rebuild "$srpm")
 
   rpm_diagnostic_write_srpm_host "$result" "$srpm"
 
