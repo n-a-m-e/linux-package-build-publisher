@@ -473,7 +473,8 @@ rpm_install_buildrequires_stepwise(){
   local result="$1" msg="$2" target="$3" phase="$4" spec_path="$5" url="$6"
   shift 6
 
-  local mock_args=("$@") deps_file log dep status index total
+  local common_args=("$@") target_args=() mock_args=()
+  local deps_file log dep status index total
 
   mkdir -p "$result"
   deps_file="$result/stepwise-buildrequires.txt"
@@ -481,6 +482,14 @@ rpm_install_buildrequires_stepwise(){
 
   rpm_buildrequires_from_spec "$spec_path" "$url" "$deps_file"
   total="$(awk 'NF { count++ } END { print count + 0 }' "$deps_file")"
+
+  # The stepwise dependency installs must use the exact same mock root and
+  # target-specific configuration as the surrounding build. In particular,
+  # TARGET_RPM_MOCK_CONFIG_OPTS and TARGET_RPM_CHROOT_SETUP_CMD are applied by
+  # rpm_mock_args_array(); dropping them here can accidentally re-enable mock's
+  # bootstrap/tooling path or initialize a different root.
+  rpm_mock_args_array "$target" "$phase" target_args
+  mock_args=("${target_args[@]}" "${common_args[@]}")
 
   {
     echo "=== stepwise BuildRequires installation ==="
@@ -491,6 +500,8 @@ rpm_install_buildrequires_stepwise(){
     echo "dependencies=$deps_file"
     echo "count=$total"
     echo "strategy=mock --pm-cmd install -y <BuildRequires-entry>"
+    echo "target_args=${target_args[*]}"
+    echo "common_args=${common_args[*]}"
     echo
     sed 's/^/  /' "$deps_file"
     echo
@@ -573,7 +584,7 @@ rpm_rebuild(){
 
   rpm_diagnostic_write_srpm_host "$result" "$srpm"
 
-  rpm_mock_with_args "$result" "mock init failed for $target" "$target" build --init
+  rpm_mock_with_args "$result" "mock init failed for $target" "$target" build "${common_args[@]}" --init
   rpm_install_buildrequires_stepwise \
     "$result" \
     "mock build dependency install failed for $(basename "$srpm")" \
