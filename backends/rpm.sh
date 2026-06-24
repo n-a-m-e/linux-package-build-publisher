@@ -315,302 +315,6 @@ rpm_diagnostic_write_failure_focus_report(){
   } >>"$log"
 }
 
-rpm_diagnostic_make_focus_file(){
-  local result="$1" focus_file="$2"
-
-  : >"$focus_file"
-
-  # Prefer the package named by the failing trigger/hook itself. If no such
-  # package can be derived, fall back to the active package mentioned by the
-  # scriptlet failure. This keeps the logic generic and avoids hard-coded
-  # package names.
-  rpm_diagnostic_trigger_package_candidates_from_logs "$result" >>"$focus_file"
-  if [[ ! -s "$focus_file" ]]; then
-    rpm_diagnostic_failure_package_candidates_from_logs "$result" >>"$focus_file"
-  fi
-
-  awk 'NF && !seen[$0]++' "$focus_file" >"$focus_file.tmp" && mv "$focus_file.tmp" "$focus_file"
-}
-
-rpm_diagnostic_clean_repoquery_output(){
-  local input="$1"
-
-  # Keep package/dependency output while dropping mock wrapper noise and
-  # package-manager chatter. This makes a repoquery form count as usable
-  # only if it actually returned dependency data, not merely Start/Finish
-  # lines from mock or metadata refresh messages from dnf.
-  awk '
-    /^[[:space:]]*$/ { next }
-    /^INFO:/ { next }
-    /^Start(:|\()/ { next }
-    /^Finish(:|\()/ { next }
-    /^Mock Version:/ { next }
-    /^ENTER / { next }
-    /^Executing command:/ { next }
-    /^Child return code was:/ { next }
-    /^ERROR:/ { next }
-    /^WARNING:/ { next }
-    /^DEBUG:/ { next }
-    /^[[:space:]]*#/ { next }
-    /^Unable to detect release version/ { next }
-    /^Last metadata expiration check:/ { next }
-    /^Dependencies resolved\./ { next }
-    /^No match for argument:/ { next }
-    /^No matches found/ { next }
-    /^Error:/ { next }
-    /^Failed to resolve/ { next }
-    { print }
-  ' "$input"
-}
-
-rpm_diagnostic_repoquery_try_form(){
-  local result="$1" target="$2" provider="$3" form="$4" tmp="$5" clean_tmp="$6" log="$7"
-  shift 7
-
-  local mock_args=("$@") status label
-
-  case "$form" in
-    tree-requires)
-      label="repoquery --tree-requires --resolve"
-      echo "mock -r $target ... --pm-cmd $label $provider" >>"$log"
-      if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --tree-requires --resolve "$provider" >"$tmp" 2>&1; then
-        status=0
-      else
-        status=$?
-      fi
-      ;;
-    requires-tree)
-      label="repoquery --requires --tree --resolve"
-      echo "mock -r $target ... --pm-cmd $label $provider" >>"$log"
-      if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --tree --resolve "$provider" >"$tmp" 2>&1; then
-        status=0
-      else
-        status=$?
-      fi
-      ;;
-    requires-tree-queryformat)
-      label="repoquery --requires --tree --resolve --queryformat %{name}"
-      echo "mock -r $target ... --pm-cmd repoquery --requires --tree --resolve --queryformat '%{name}' $provider" >>"$log"
-      if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --tree --resolve --queryformat '%{name}' "$provider" >"$tmp" 2>&1; then
-        status=0
-      else
-        status=$?
-      fi
-      ;;
-    requires-recursive)
-      label="repoquery --requires --resolve --recursive"
-      echo "mock -r $target ... --pm-cmd $label $provider" >>"$log"
-      if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --resolve --recursive "$provider" >"$tmp" 2>&1; then
-        status=0
-      else
-        status=$?
-      fi
-      ;;
-    *)
-      echo "internal error: unknown repoquery diagnostic form: $form" >>"$log"
-      return 2
-      ;;
-  esac
-
-  rpm_diagnostic_clean_repoquery_output "$tmp" >"$clean_tmp" || true
-
-  if ((status == 0)) && [[ -s "$clean_tmp" ]]; then
-    printf '%s\n' "$label"
-    return 0
-  fi
-
-  {
-    if ((status != 0)); then
-      echo "$label exited with status $status"
-    else
-      echo "$label returned no meaningful package/dependency output; trying next fallback"
-    fi
-    echo "raw output tail:"
-    sed 's/^/  /' "$tmp" | tail -n 80
-  } >>"$log"
-
-  return 1
-}
-
-rpm_diagnostic_repoquery_dependency_tree_for_provider(){
-  local result="$1" target="$2" provider="$3" focus_file="$4" log="$5"
-  shift 5
-
-  local mock_args=("$@") tmp clean_tmp status used_label found_focus=0 safe_provider form
-
-  safe_provider="$(safe_id "$provider")"
-  tmp="$result/repoquery-tree-$safe_provider.log"
-  clean_tmp="$result/repoquery-tree-$safe_provider.clean.log"
-
-  {
-    echo
-    echo "--- dependency tree query for direct provider: $provider ---"
-  } >>"$log"
-
-  : >"$tmp"
-  : >"$clean_tmp"
-  used_label=""
-
-  for form in tree-requires requires-tree requires-tree-queryformat requires-recursive; do
-    : >"$tmp"
-    : >"$clean_tmp"
-    if used_label="$(rpm_diagnostic_repoquery_try_form "$result" "$target" "$provider" "$form" "$tmp" "$clean_tmp" "$log" "${mock_args[@]}")"; then
-      break
-    else
-      status=$?
-      used_label=""
-      ((status == 2)) && break
-    fi
-  done
-
-  if [[ -z "$used_label" ]]; then
-    {
-      echo "no supported repoquery dependency-tree form produced meaningful output for provider: $provider"
-      echo "last raw output is saved at: $tmp"
-    } >>"$log"
-    return 0
-  fi
-
-  {
-    echo "used=$used_label"
-    echo "raw_output=$tmp"
-    echo "clean_output=$clean_tmp"
-  } >>"$log"
-
-  if [[ -s "$focus_file" ]] && grep -F -f "$focus_file" "$clean_tmp" >/dev/null 2>&1; then
-    found_focus=1
-    {
-      echo "matched derived failure package candidate(s); cleaned dependency output follows:"
-      cat "$clean_tmp"
-    } >>"$log"
-  else
-    {
-      echo "no derived failure package candidates found in this provider dependency output"
-      echo "first 80 cleaned dependency lines for context:"
-      sed -n '1,80p' "$clean_tmp"
-    } >>"$log"
-  fi
-
-  return 0
-}
-
-rpm_diagnostic_repoquery_direct_installing_dependency_chains(){
-  local result="$1" target="$2" provider_file="$3" log="$4"
-  shift 4
-
-  local mock_args=("$@") focus_file provider found=0
-
-  focus_file="$result/failure-package-candidates.txt"
-  rpm_diagnostic_make_focus_file "$result" "$focus_file"
-
-  {
-    echo
-    echo "=== dependency-chain repoquery for each direct builddep provider ==="
-    if [[ -s "$focus_file" ]]; then
-      echo "derived failure package candidates used for matching:"
-      sed 's/^/  /' "$focus_file"
-    else
-      echo "no derived failure package candidates were found; repoquery output will be shown as context only"
-    fi
-  } >>"$log"
-
-  while IFS= read -r provider; do
-    [[ -n "$provider" ]] || continue
-    found=1
-    rpm_diagnostic_repoquery_dependency_tree_for_provider "$result" "$target" "$provider" "$focus_file" "$log" "${mock_args[@]}"
-  done <"$provider_file"
-
-  if ! ((found)); then
-    echo "no direct builddep providers were available for dependency-chain repoquery diagnostics" >>"$log"
-  fi
-}
-
-rpm_diagnostic_mock_dry_run_direct_installing(){
-  local result="$1" target="$2" phase="$3" msg="$4" srpm="$5" local_repo="$6"
-  shift 6
-
-  local mock_args=("$@") log provider provider_file status found=0
-
-  mkdir -p "$result"
-  log="$result/direct-builddep-provider-diagnostics.log"
-
-  {
-    echo "=== diagnostic context ==="
-    echo "target=$target"
-    echo "phase=$phase"
-    echo "message=$msg"
-    [[ -n "$srpm" ]] && echo "srpm=$srpm"
-    [[ -n "$local_repo" ]] && echo "local_repo=$local_repo"
-    echo
-  } >"$log"
-
-  provider_file="$result/direct-builddep-providers.txt"
-  rpm_diagnostic_write_direct_provider_file "$result" "$provider_file"
-
-  rpm_diagnostic_transaction_sections_from_logs "$result" >>"$log"
-  rpm_diagnostic_scriptlet_failures_from_logs "$result" >>"$log"
-  rpm_diagnostic_write_failure_focus_report "$result" "$log"
-  rpm_diagnostic_write_direct_installing_report "$result" "$log" "$provider_file"
-
-  {
-    echo "=== reset and re-init mock root ==="
-    echo "mock -r $target ... --scrub=all"
-  } >>"$log"
-  mock -r "$target" "${mock_args[@]}" --scrub=all >>"$log" 2>&1 || {
-    status=$?
-    echo "mock scrub exited with status $status; continuing to re-init for diagnostics" >>"$log"
-  }
-
-  {
-    echo
-    echo "mock -r $target ... --init"
-  } >>"$log"
-  if ! mock -r "$target" "${mock_args[@]}" --init >>"$log" 2>&1; then
-    status=$?
-    {
-      echo
-      echo "=== unable to re-init mock root for direct provider transaction tests ==="
-      echo "exit_status=$status"
-      echo
-    } >>"$log"
-    echo "--- ${log#$result/} ---" >&2
-    cat "$log" >&2 || true
-    return 0
-  fi
-
-  rpm_diagnostic_repoquery_direct_installing_dependency_chains "$result" "$target" "$provider_file" "$log" "${mock_args[@]}"
-
-  {
-    echo
-    echo "=== transaction-test package-manager install for each direct builddep provider ==="
-  } >>"$log"
-
-  while IFS= read -r provider; do
-    [[ -n "$provider" ]] || continue
-    found=1
-    {
-      echo
-      echo "--- mock --pm-cmd install -y --setopt=tsflags=test $provider ---"
-    } >>"$log"
-
-    # Use mock's package-manager interface instead of running dnf inside
-    # the chroot. Some mock roots do not contain /usr/bin/dnf, while
-    # mock itself can still drive the configured package manager with the
-    # buildroot as the installroot.
-    mock -r "$target" "${mock_args[@]}" --pm-cmd install -y --setopt=tsflags=test "$provider" >>"$log" 2>&1 || {
-      status=$?
-      echo "mock --pm-cmd transaction test exited with status $status" >>"$log"
-    }
-  done <"$provider_file"
-
-  if ! ((found)); then
-    echo "no direct builddep providers were available for transaction-test diagnostics" >>"$log"
-  fi
-
-  echo "--- ${log#$result/} ---" >&2
-  cat "$log" >&2 || true
-}
-
 rpm_mock_args_array(){
   local target="$1" phase="$2" family arch
   local -n out_args="$3"
@@ -713,6 +417,189 @@ rpm_prepare_effective(){
   printf '%s' "$spec_path"
 }
 
+
+rpm_buildrequires_from_spec(){
+  local spec_path="$1" url="${2:-}" output="$3"
+  local expanded tmp
+
+  [[ -f "$spec_path" ]] || die "Missing spec for BuildRequires parsing: $spec_path"
+  mkdir -p "$(dirname "$output")"
+
+  expanded="$output.expanded"
+  tmp="$output.tmp"
+
+  if [[ -n "$url" ]]; then
+    rpmspec --define "url $url" -P "$spec_path" >"$expanded"
+  else
+    rpmspec -P "$spec_path" >"$expanded"
+  fi
+
+  awk '
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    /^[[:space:]]*BuildRequires:[[:space:]]*/ {
+      line = $0
+      sub(/^[[:space:]]*BuildRequires:[[:space:]]*/, "", line)
+      sub(/[[:space:]]+#.*$/, "", line)
+      n = split(line, deps, /,[[:space:]]*/)
+      for (i = 1; i <= n; i++) {
+        dep = trim(deps[i])
+        if (dep != "" && !seen[dep]++) print dep
+      }
+    }
+  ' "$expanded" >"$tmp"
+
+  mv "$tmp" "$output"
+  rm -f "$expanded"
+
+  [[ -s "$output" ]] || die "No BuildRequires entries found in expanded spec: $spec_path"
+}
+
+rpm_write_single_buildrequires_probe_spec(){
+  local dep="$1" spec_file="$2" index="$3"
+
+  cat >"$spec_file" <<EOF
+Name: repository-builder-buildrequire-$index
+Version: 1
+Release: 1
+Summary: Temporary BuildRequires probe for repository builder
+License: MIT
+BuildArch: noarch
+BuildRequires: $dep
+
+%description
+Temporary source package used to install one BuildRequires entry at a time.
+EOF
+}
+
+rpm_build_single_buildrequires_srpm(){
+  local result="$1" dep="$2" index="$3" out_var="$4"
+  local safe_index topdir specdir srpmdir builddir rpmdir sourcedir spec_file srpm
+
+  safe_index="$(printf '%04d' "$index")"
+  topdir="$result/stepwise-buildrequires-srpms/$safe_index"
+  specdir="$topdir/SPECS"
+  srpmdir="$topdir/SRPMS"
+  builddir="$topdir/BUILD"
+  rpmdir="$topdir/RPMS"
+  sourcedir="$topdir/SOURCES"
+
+  fresh_dir "$topdir"
+  mkdir -p "$specdir" "$srpmdir" "$builddir" "$rpmdir" "$sourcedir"
+
+  spec_file="$specdir/repository-builder-buildrequire-$safe_index.spec"
+  rpm_write_single_buildrequires_probe_spec "$dep" "$spec_file" "$safe_index"
+
+  rpmbuild -bs --nodeps \
+    --define "_topdir $topdir" \
+    --define "_specdir $specdir" \
+    --define "_sourcedir $sourcedir" \
+    --define "_srcrpmdir $srpmdir" \
+    --define "_builddir $builddir" \
+    --define "_rpmdir $rpmdir" \
+    "$spec_file" >/dev/null
+
+  srpm="$(find "$srpmdir" -maxdepth 1 -name '*.src.rpm' -print -quit)"
+  [[ -n "$srpm" ]] || die "Failed to create temporary BuildRequires SRPM for dependency: $dep"
+
+  printf -v "$out_var" '%s' "$srpm"
+}
+
+rpm_stepwise_buildrequires_failure_report(){
+  local result="$1" log="$2"
+
+  {
+    echo
+    rpm_diagnostic_transaction_sections_from_logs "$result"
+    rpm_diagnostic_scriptlet_failures_from_logs "$result"
+    rpm_diagnostic_write_failure_focus_report "$result" /dev/stdout
+  } >>"$log" 2>&1 || true
+}
+
+rpm_install_buildrequires_stepwise(){
+  local result="$1" msg="$2" target="$3" phase="$4" spec_path="$5" url="$6"
+  shift 6
+
+  local mock_args=("$@") deps_file log dep dep_srpm status index total
+
+  mkdir -p "$result"
+  deps_file="$result/stepwise-buildrequires.txt"
+  log="$result/stepwise-buildrequires.log"
+
+  rpm_buildrequires_from_spec "$spec_path" "$url" "$deps_file"
+  total="$(awk 'NF { count++ } END { print count + 0 }' "$deps_file")"
+
+  {
+    echo "=== stepwise BuildRequires installation ==="
+    echo "target=$target"
+    echo "phase=$phase"
+    echo "spec=$spec_path"
+    [[ -n "$url" ]] && echo "url=$url"
+    echo "dependencies=$deps_file"
+    echo "count=$total"
+    echo
+    sed 's/^/  /' "$deps_file"
+    echo
+  } >"$log"
+
+  index=0
+  while IFS= read -r dep; do
+    [[ -n "$dep" ]] || continue
+    index=$((index + 1))
+
+    {
+      echo
+      echo "=== BuildRequires $index/$total ==="
+      echo "dependency=$dep"
+    } | tee -a "$log" >&2
+
+    if rpm_build_single_buildrequires_srpm "$result" "$dep" "$index" dep_srpm >>"$log" 2>&1; then
+      :
+    else
+      status=$?
+      {
+        echo "failed to create temporary BuildRequires SRPM"
+        echo "exit_status=$status"
+      } >>"$log"
+      echo "--- ${log#$result/} ---" >&2
+      cat "$log" >&2 || true
+      die "Failed to prepare one-at-a-time BuildRequires install for dependency: $dep"
+    fi
+
+    {
+      echo "temporary_srpm=$dep_srpm"
+      echo "mock -r $target ... --installdeps $dep_srpm"
+    } >>"$log"
+
+    if mock -r "$target" "${mock_args[@]}" --installdeps "$dep_srpm" >>"$log" 2>&1; then
+      :
+    else
+      status=$?
+      {
+        echo
+        echo "=== failed BuildRequires dependency ==="
+        echo "dependency=$dep"
+        echo "temporary_srpm=$dep_srpm"
+        echo "exit_status=$status"
+      } >>"$log"
+
+      rpm_stepwise_buildrequires_failure_report "$result" "$log"
+      rpm_dump_mock_failure "$result" "$msg"
+      echo "--- ${log#$result/} ---" >&2
+      cat "$log" >&2 || true
+      die "$msg; failed while installing BuildRequires entry: $dep"
+    fi
+  done <"$deps_file"
+
+  {
+    echo
+    echo "=== all BuildRequires entries installed successfully ==="
+  } >>"$log"
+}
+
 rpm_build_srpm(){
   local target="$1" unique="$2" result="$3" pkg_dir="$4" spec_path="$5" url="${6:-}"
   local args=()
@@ -735,26 +622,8 @@ rpm_build_srpm(){
     "${args[@]}"
 }
 
-rpm_mock_installdeps_with_diagnostics(){
-  local result="$1" msg="$2" target="$3" phase="$4" srpm="$5" local_repo="$6"
-  shift 6
-
-  local mock_args=()
-  rpm_mock_args_array "$target" "$phase" mock_args
-  mock_args+=("$@")
-
-  mkdir -p "$result"
-  if mock -r "$target" "${mock_args[@]}" --installdeps "$srpm"; then
-    return 0
-  fi
-
-  rpm_dump_mock_failure "$result" "$msg"
-  rpm_diagnostic_mock_dry_run_direct_installing "$result" "$target" "$phase" "$msg" "$srpm" "$local_repo" "${mock_args[@]}"
-  die "$msg"
-}
-
 rpm_rebuild(){
-  local target="$1" unique="$2" result="$3" local_repo="$4" srpm="$5" url="${6:-}"
+  local target="$1" unique="$2" result="$3" local_repo="$4" srpm="$5" spec_path="$6" url="${7:-}"
   local common_args=() rebuild_args=()
 
   common_args=(
@@ -770,13 +639,13 @@ rpm_rebuild(){
   rpm_diagnostic_write_srpm_host "$result" "$srpm"
 
   rpm_mock_with_args "$result" "mock init failed for $target" "$target" build --init
-  rpm_mock_installdeps_with_diagnostics \
+  rpm_install_buildrequires_stepwise \
     "$result" \
     "mock build dependency install failed for $(basename "$srpm")" \
     "$target" \
     build \
-    "$srpm" \
-    "$local_repo" \
+    "$spec_path" \
+    "$url" \
     "${common_args[@]}"
 
   rpm_mock_with_args "$result" "mock rebuild failed for $(basename "$srpm")" "$target" build "${rebuild_args[@]}"
@@ -1055,7 +924,7 @@ rpm_build_queued(){
   rpm_build_srpm "$target" "srpm-$target-$build_id" "$srpm_dir" "$spec_dir" "$spec_path" "$url"
   srpm="$(find "$srpm_dir" -maxdepth 1 -name '*.src.rpm' -print -quit)"
   [[ -n "$srpm" ]] || die "No SRPM created for $target/$build_id"
-  rpm_rebuild "$target" "$target-$build_id" "$result" "$local_repo" "$srpm" "$url"
+  rpm_rebuild "$target" "$target-$build_id" "$result" "$local_repo" "$srpm" "$spec_path" "$url"
   rm -f "$cache"/*.rpm "$cache"/*.src.rpm
   find "$result" -name '*.rpm' -type f -exec cp {} "$cache/" \;
   printf '%s' "$fp" >"$cache/.fingerprint"
