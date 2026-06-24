@@ -192,16 +192,31 @@ rpm_diagnostic_direct_installing_packages_from_logs(){
   done < <(rpm_diagnostic_mock_log_files "$result") | awk 'NF && !seen[$0]++'
 }
 
+rpm_diagnostic_write_direct_provider_file(){
+  local result="$1" provider_file="$2"
+
+  rpm_diagnostic_direct_installing_packages_from_logs "$result" \
+    | awk 'NF && !seen[$0]++' >"$provider_file"
+}
+
 rpm_diagnostic_write_direct_installing_report(){
-  local result="$1" log="$2" provider found=0
+  local result="$1" log="$2" provider_file="${3:-}" provider found=0
 
   {
     echo "=== direct Installing packages from failed transaction ==="
-    while IFS= read -r provider; do
-      [[ -n "$provider" ]] || continue
-      found=1
-      printf '%s\n' "$provider"
-    done < <(rpm_diagnostic_direct_installing_packages_from_logs "$result")
+    if [[ -n "$provider_file" && -f "$provider_file" ]]; then
+      while IFS= read -r provider; do
+        [[ -n "$provider" ]] || continue
+        found=1
+        printf '%s\n' "$provider"
+      done <"$provider_file"
+    else
+      while IFS= read -r provider; do
+        [[ -n "$provider" ]] || continue
+        found=1
+        printf '%s\n' "$provider"
+      done < <(rpm_diagnostic_direct_installing_packages_from_logs "$result")
+    fi
     ((found)) || echo "no direct Installing packages found in mock logs"
     echo
   } >>"$log"
@@ -317,14 +332,115 @@ rpm_diagnostic_make_focus_file(){
   awk 'NF && !seen[$0]++' "$focus_file" >"$focus_file.tmp" && mv "$focus_file.tmp" "$focus_file"
 }
 
+rpm_diagnostic_clean_repoquery_output(){
+  local input="$1"
+
+  # Keep package/dependency output while dropping mock wrapper noise and
+  # package-manager chatter. This makes a repoquery form count as usable
+  # only if it actually returned dependency data, not merely Start/Finish
+  # lines from mock or metadata refresh messages from dnf.
+  awk '
+    /^[[:space:]]*$/ { next }
+    /^INFO:/ { next }
+    /^Start(:|\()/ { next }
+    /^Finish(:|\()/ { next }
+    /^Mock Version:/ { next }
+    /^ENTER / { next }
+    /^Executing command:/ { next }
+    /^Child return code was:/ { next }
+    /^ERROR:/ { next }
+    /^WARNING:/ { next }
+    /^DEBUG:/ { next }
+    /^[[:space:]]*#/ { next }
+    /^Unable to detect release version/ { next }
+    /^Last metadata expiration check:/ { next }
+    /^Dependencies resolved\./ { next }
+    /^No match for argument:/ { next }
+    /^No matches found/ { next }
+    /^Error:/ { next }
+    /^Failed to resolve/ { next }
+    { print }
+  ' "$input"
+}
+
+rpm_diagnostic_repoquery_try_form(){
+  local result="$1" target="$2" provider="$3" form="$4" tmp="$5" clean_tmp="$6" log="$7"
+  shift 7
+
+  local mock_args=("$@") status label
+
+  case "$form" in
+    tree-requires)
+      label="repoquery --tree-requires --resolve"
+      echo "mock -r $target ... --pm-cmd $label $provider" >>"$log"
+      if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --tree-requires --resolve "$provider" >"$tmp" 2>&1; then
+        status=0
+      else
+        status=$?
+      fi
+      ;;
+    requires-tree)
+      label="repoquery --requires --tree --resolve"
+      echo "mock -r $target ... --pm-cmd $label $provider" >>"$log"
+      if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --tree --resolve "$provider" >"$tmp" 2>&1; then
+        status=0
+      else
+        status=$?
+      fi
+      ;;
+    requires-tree-queryformat)
+      label="repoquery --requires --tree --resolve --queryformat %{name}"
+      echo "mock -r $target ... --pm-cmd repoquery --requires --tree --resolve --queryformat '%{name}' $provider" >>"$log"
+      if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --tree --resolve --queryformat '%{name}' "$provider" >"$tmp" 2>&1; then
+        status=0
+      else
+        status=$?
+      fi
+      ;;
+    requires-recursive)
+      label="repoquery --requires --resolve --recursive"
+      echo "mock -r $target ... --pm-cmd $label $provider" >>"$log"
+      if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --resolve --recursive "$provider" >"$tmp" 2>&1; then
+        status=0
+      else
+        status=$?
+      fi
+      ;;
+    *)
+      echo "internal error: unknown repoquery diagnostic form: $form" >>"$log"
+      return 2
+      ;;
+  esac
+
+  rpm_diagnostic_clean_repoquery_output "$tmp" >"$clean_tmp" || true
+
+  if ((status == 0)) && [[ -s "$clean_tmp" ]]; then
+    printf '%s\n' "$label"
+    return 0
+  fi
+
+  {
+    if ((status != 0)); then
+      echo "$label exited with status $status"
+    else
+      echo "$label returned no meaningful package/dependency output; trying next fallback"
+    fi
+    echo "raw output tail:"
+    sed 's/^/  /' "$tmp" | tail -n 80
+  } >>"$log"
+
+  return 1
+}
+
 rpm_diagnostic_repoquery_dependency_tree_for_provider(){
   local result="$1" target="$2" provider="$3" focus_file="$4" log="$5"
   shift 5
 
-  local mock_args=("$@") tmp status used_label found_focus=0 safe_provider
+  local mock_args=("$@") tmp clean_tmp status used_label found_focus=0 safe_provider form
 
   safe_provider="$(safe_id "$provider")"
   tmp="$result/repoquery-tree-$safe_provider.log"
+  clean_tmp="$result/repoquery-tree-$safe_provider.clean.log"
 
   {
     echo
@@ -332,69 +448,46 @@ rpm_diagnostic_repoquery_dependency_tree_for_provider(){
   } >>"$log"
 
   : >"$tmp"
-  echo "mock -r $target ... --pm-cmd repoquery --tree-requires --resolve $provider" >>"$log"
-  if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --tree-requires --resolve "$provider" >"$tmp" 2>&1; then
-    used_label="repoquery --tree-requires --resolve"
-  else
-    status=$?
-    {
-      echo "repoquery --tree-requires --resolve exited with status $status"
-      sed 's/^/  /' "$tmp" | tail -n 80
-    } >>"$log"
+  : >"$clean_tmp"
+  used_label=""
+
+  for form in tree-requires requires-tree requires-tree-queryformat requires-recursive; do
     : >"$tmp"
-    echo "mock -r $target ... --pm-cmd repoquery --requires --tree --resolve $provider" >>"$log"
-    if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --tree --resolve "$provider" >"$tmp" 2>&1; then
-      used_label="repoquery --requires --tree --resolve"
+    : >"$clean_tmp"
+    if used_label="$(rpm_diagnostic_repoquery_try_form "$result" "$target" "$provider" "$form" "$tmp" "$clean_tmp" "$log" "${mock_args[@]}")"; then
+      break
     else
       status=$?
-      {
-        echo "repoquery --requires --tree --resolve exited with status $status"
-        sed 's/^/  /' "$tmp" | tail -n 80
-      } >>"$log"
-      : >"$tmp"
-      echo "mock -r $target ... --pm-cmd repoquery --requires --tree --resolve --queryformat '%{name}' $provider" >>"$log"
-      if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --tree --resolve --queryformat '%{name}' "$provider" >"$tmp" 2>&1; then
-        used_label="repoquery --requires --tree --resolve --queryformat %{name}"
-      else
-        status=$?
-        {
-          echo "repoquery --requires --tree --resolve --queryformat %{name} exited with status $status"
-          sed 's/^/  /' "$tmp" | tail -n 80
-        } >>"$log"
-        : >"$tmp"
-        echo "mock -r $target ... --pm-cmd repoquery --requires --resolve --recursive $provider" >>"$log"
-        if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --resolve --recursive "$provider" >"$tmp" 2>&1; then
-          used_label="repoquery --requires --resolve --recursive"
-        else
-          status=$?
-          {
-            echo "repoquery dependency query fallback exited with status $status"
-            sed 's/^/  /' "$tmp" | tail -n 80
-            echo "no supported repoquery dependency-tree form worked for provider: $provider"
-          } >>"$log"
-          rm -f "$tmp"
-          return 0
-        fi
-      fi
+      used_label=""
+      ((status == 2)) && break
     fi
+  done
+
+  if [[ -z "$used_label" ]]; then
+    {
+      echo "no supported repoquery dependency-tree form produced meaningful output for provider: $provider"
+      echo "last raw output is saved at: $tmp"
+    } >>"$log"
+    return 0
   fi
 
   {
     echo "used=$used_label"
-    echo "output=$tmp"
+    echo "raw_output=$tmp"
+    echo "clean_output=$clean_tmp"
   } >>"$log"
 
-  if [[ -s "$focus_file" ]] && grep -F -f "$focus_file" "$tmp" >/dev/null 2>&1; then
+  if [[ -s "$focus_file" ]] && grep -F -f "$focus_file" "$clean_tmp" >/dev/null 2>&1; then
     found_focus=1
     {
-      echo "matched derived failure package candidate(s); dependency output follows:"
-      cat "$tmp"
+      echo "matched derived failure package candidate(s); cleaned dependency output follows:"
+      cat "$clean_tmp"
     } >>"$log"
   else
     {
       echo "no derived failure package candidates found in this provider dependency output"
-      echo "first 80 lines for context:"
-      sed -n '1,80p' "$tmp"
+      echo "first 80 cleaned dependency lines for context:"
+      sed -n '1,80p' "$clean_tmp"
     } >>"$log"
   fi
 
@@ -402,8 +495,8 @@ rpm_diagnostic_repoquery_dependency_tree_for_provider(){
 }
 
 rpm_diagnostic_repoquery_direct_installing_dependency_chains(){
-  local result="$1" target="$2" log="$3"
-  shift 3
+  local result="$1" target="$2" provider_file="$3" log="$4"
+  shift 4
 
   local mock_args=("$@") focus_file provider found=0
 
@@ -425,7 +518,7 @@ rpm_diagnostic_repoquery_direct_installing_dependency_chains(){
     [[ -n "$provider" ]] || continue
     found=1
     rpm_diagnostic_repoquery_dependency_tree_for_provider "$result" "$target" "$provider" "$focus_file" "$log" "${mock_args[@]}"
-  done < <(rpm_diagnostic_direct_installing_packages_from_logs "$result")
+  done <"$provider_file"
 
   if ! ((found)); then
     echo "no direct builddep providers were available for dependency-chain repoquery diagnostics" >>"$log"
@@ -436,7 +529,7 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
   local result="$1" target="$2" phase="$3" msg="$4" srpm="$5" local_repo="$6"
   shift 6
 
-  local mock_args=("$@") log provider status found=0
+  local mock_args=("$@") log provider provider_file status found=0
 
   mkdir -p "$result"
   log="$result/direct-builddep-provider-diagnostics.log"
@@ -451,10 +544,13 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
     echo
   } >"$log"
 
+  provider_file="$result/direct-builddep-providers.txt"
+  rpm_diagnostic_write_direct_provider_file "$result" "$provider_file"
+
   rpm_diagnostic_transaction_sections_from_logs "$result" >>"$log"
   rpm_diagnostic_scriptlet_failures_from_logs "$result" >>"$log"
   rpm_diagnostic_write_failure_focus_report "$result" "$log"
-  rpm_diagnostic_write_direct_installing_report "$result" "$log"
+  rpm_diagnostic_write_direct_installing_report "$result" "$log" "$provider_file"
 
   {
     echo "=== reset and re-init mock root ==="
@@ -482,7 +578,7 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
     return 0
   fi
 
-  rpm_diagnostic_repoquery_direct_installing_dependency_chains "$result" "$target" "$log" "${mock_args[@]}"
+  rpm_diagnostic_repoquery_direct_installing_dependency_chains "$result" "$target" "$provider_file" "$log" "${mock_args[@]}"
 
   {
     echo
@@ -505,7 +601,7 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
       status=$?
       echo "mock --pm-cmd transaction test exited with status $status" >>"$log"
     }
-  done < <(rpm_diagnostic_direct_installing_packages_from_logs "$result")
+  done <"$provider_file"
 
   if ! ((found)); then
     echo "no direct builddep providers were available for transaction-test diagnostics" >>"$log"
