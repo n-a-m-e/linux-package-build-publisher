@@ -207,6 +207,231 @@ rpm_diagnostic_write_direct_installing_report(){
   } >>"$log"
 }
 
+rpm_diagnostic_package_name_candidates(){
+  local raw="${1:-}" value arch
+
+  raw="${raw%%[[:space:]:,;]*}"
+  raw="${raw#\"}"
+  raw="${raw%\"}"
+  [[ -n "$raw" ]] || return 0
+
+  printf '%s\n' "$raw"
+
+  value="$raw"
+  for arch in x86_64 aarch64 noarch i586 i686 armv7hl armv7hnl ppc64le s390x src; do
+    if [[ "$value" == *."$arch" ]]; then
+      value="${value%."$arch"}"
+      break
+    fi
+  done
+
+  # Convert a common NEVRA-like string such as name-1.2-3.x86_64 to name.
+  # This is intentionally only a candidate generator; the raw value remains
+  # included above so unusual package names are not lost.
+  if [[ "$value" =~ ^(.+)-([0-9][^-]*)-([^-]+)$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+
+rpm_diagnostic_trigger_package_candidates_from_logs(){
+  local result="$1" log line rest token payload
+
+  while IFS= read -r log; do
+    while IFS= read -r line; do
+      rest="$line"
+      while [[ "$rest" =~ %[A-Za-z0-9_]+\(([^\)]+)\) ]]; do
+        payload="${BASH_REMATCH[1]}"
+        rpm_diagnostic_package_name_candidates "$payload"
+        rest="${rest#*%}"
+        rest="${rest#*)}"
+      done
+    done <"$log"
+  done < <(rpm_diagnostic_mock_log_files "$result") | awk 'NF && !seen[$0]++'
+}
+
+rpm_diagnostic_active_scriptlet_packages_from_logs(){
+  local result="$1" log line active
+
+  while IFS= read -r log; do
+    while IFS= read -r line; do
+      case "$line" in
+        *'scriptlet in rpm package '*)
+          active="${line#*scriptlet in rpm package }"
+          active="${active%%[[:space:]:,;]*}"
+          rpm_diagnostic_package_name_candidates "$active"
+          ;;
+      esac
+    done <"$log"
+  done < <(rpm_diagnostic_mock_log_files "$result") | awk 'NF && !seen[$0]++'
+}
+
+rpm_diagnostic_failure_package_candidates_from_logs(){
+  local result="$1"
+
+  {
+    rpm_diagnostic_trigger_package_candidates_from_logs "$result"
+    rpm_diagnostic_active_scriptlet_packages_from_logs "$result"
+  } | awk 'NF && !seen[$0]++'
+}
+
+rpm_diagnostic_write_failure_focus_report(){
+  local result="$1" log="$2" item found=0
+
+  {
+    echo "=== failure package candidates from mock logs ==="
+    echo "[trigger/scriptlet owner candidates]"
+    while IFS= read -r item; do
+      [[ -n "$item" ]] || continue
+      found=1
+      printf '%s\n' "$item"
+    done < <(rpm_diagnostic_trigger_package_candidates_from_logs "$result")
+    ((found)) || echo "none found"
+
+    found=0
+    echo
+    echo "[active scriptlet package candidates]"
+    while IFS= read -r item; do
+      [[ -n "$item" ]] || continue
+      found=1
+      printf '%s\n' "$item"
+    done < <(rpm_diagnostic_active_scriptlet_packages_from_logs "$result")
+    ((found)) || echo "none found"
+    echo
+  } >>"$log"
+}
+
+rpm_diagnostic_make_focus_file(){
+  local result="$1" focus_file="$2"
+
+  : >"$focus_file"
+
+  # Prefer the package named by the failing trigger/hook itself. If no such
+  # package can be derived, fall back to the active package mentioned by the
+  # scriptlet failure. This keeps the logic generic and avoids hard-coded
+  # package names.
+  rpm_diagnostic_trigger_package_candidates_from_logs "$result" >>"$focus_file"
+  if [[ ! -s "$focus_file" ]]; then
+    rpm_diagnostic_failure_package_candidates_from_logs "$result" >>"$focus_file"
+  fi
+
+  awk 'NF && !seen[$0]++' "$focus_file" >"$focus_file.tmp" && mv "$focus_file.tmp" "$focus_file"
+}
+
+rpm_diagnostic_repoquery_dependency_tree_for_provider(){
+  local result="$1" target="$2" provider="$3" focus_file="$4" log="$5"
+  shift 5
+
+  local mock_args=("$@") tmp status used_label found_focus=0 safe_provider
+
+  safe_provider="$(safe_id "$provider")"
+  tmp="$result/repoquery-tree-$safe_provider.log"
+
+  {
+    echo
+    echo "--- dependency tree query for direct provider: $provider ---"
+  } >>"$log"
+
+  : >"$tmp"
+  echo "mock -r $target ... --pm-cmd repoquery --tree-requires --resolve $provider" >>"$log"
+  if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --tree-requires --resolve "$provider" >"$tmp" 2>&1; then
+    used_label="repoquery --tree-requires --resolve"
+  else
+    status=$?
+    {
+      echo "repoquery --tree-requires --resolve exited with status $status"
+      sed 's/^/  /' "$tmp" | tail -n 80
+    } >>"$log"
+    : >"$tmp"
+    echo "mock -r $target ... --pm-cmd repoquery --requires --tree --resolve $provider" >>"$log"
+    if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --tree --resolve "$provider" >"$tmp" 2>&1; then
+      used_label="repoquery --requires --tree --resolve"
+    else
+      status=$?
+      {
+        echo "repoquery --requires --tree --resolve exited with status $status"
+        sed 's/^/  /' "$tmp" | tail -n 80
+      } >>"$log"
+      : >"$tmp"
+      echo "mock -r $target ... --pm-cmd repoquery --requires --tree --resolve --queryformat '%{name}' $provider" >>"$log"
+      if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --tree --resolve --queryformat '%{name}' "$provider" >"$tmp" 2>&1; then
+        used_label="repoquery --requires --tree --resolve --queryformat %{name}"
+      else
+        status=$?
+        {
+          echo "repoquery --requires --tree --resolve --queryformat %{name} exited with status $status"
+          sed 's/^/  /' "$tmp" | tail -n 80
+        } >>"$log"
+        : >"$tmp"
+        echo "mock -r $target ... --pm-cmd repoquery --requires --resolve --recursive $provider" >>"$log"
+        if mock -r "$target" "${mock_args[@]}" --pm-cmd repoquery --requires --resolve --recursive "$provider" >"$tmp" 2>&1; then
+          used_label="repoquery --requires --resolve --recursive"
+        else
+          status=$?
+          {
+            echo "repoquery dependency query fallback exited with status $status"
+            sed 's/^/  /' "$tmp" | tail -n 80
+            echo "no supported repoquery dependency-tree form worked for provider: $provider"
+          } >>"$log"
+          rm -f "$tmp"
+          return 0
+        fi
+      fi
+    fi
+  fi
+
+  {
+    echo "used=$used_label"
+    echo "output=$tmp"
+  } >>"$log"
+
+  if [[ -s "$focus_file" ]] && grep -F -f "$focus_file" "$tmp" >/dev/null 2>&1; then
+    found_focus=1
+    {
+      echo "matched derived failure package candidate(s); dependency output follows:"
+      cat "$tmp"
+    } >>"$log"
+  else
+    {
+      echo "no derived failure package candidates found in this provider dependency output"
+      echo "first 80 lines for context:"
+      sed -n '1,80p' "$tmp"
+    } >>"$log"
+  fi
+
+  return 0
+}
+
+rpm_diagnostic_repoquery_direct_installing_dependency_chains(){
+  local result="$1" target="$2" log="$3"
+  shift 3
+
+  local mock_args=("$@") focus_file provider found=0
+
+  focus_file="$result/failure-package-candidates.txt"
+  rpm_diagnostic_make_focus_file "$result" "$focus_file"
+
+  {
+    echo
+    echo "=== dependency-chain repoquery for each direct builddep provider ==="
+    if [[ -s "$focus_file" ]]; then
+      echo "derived failure package candidates used for matching:"
+      sed 's/^/  /' "$focus_file"
+    else
+      echo "no derived failure package candidates were found; repoquery output will be shown as context only"
+    fi
+  } >>"$log"
+
+  while IFS= read -r provider; do
+    [[ -n "$provider" ]] || continue
+    found=1
+    rpm_diagnostic_repoquery_dependency_tree_for_provider "$result" "$target" "$provider" "$focus_file" "$log" "${mock_args[@]}"
+  done < <(rpm_diagnostic_direct_installing_packages_from_logs "$result")
+
+  if ! ((found)); then
+    echo "no direct builddep providers were available for dependency-chain repoquery diagnostics" >>"$log"
+  fi
+}
+
 rpm_diagnostic_mock_dry_run_direct_installing(){
   local result="$1" target="$2" phase="$3" msg="$4" srpm="$5" local_repo="$6"
   shift 6
@@ -228,6 +453,7 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
 
   rpm_diagnostic_transaction_sections_from_logs "$result" >>"$log"
   rpm_diagnostic_scriptlet_failures_from_logs "$result" >>"$log"
+  rpm_diagnostic_write_failure_focus_report "$result" "$log"
   rpm_diagnostic_write_direct_installing_report "$result" "$log"
 
   {
@@ -255,6 +481,8 @@ rpm_diagnostic_mock_dry_run_direct_installing(){
     cat "$log" >&2 || true
     return 0
   fi
+
+  rpm_diagnostic_repoquery_direct_installing_dependency_chains "$result" "$target" "$log" "${mock_args[@]}"
 
   {
     echo
