@@ -524,6 +524,141 @@ rpm_finalize_stepwise_buildroot(){
   fi
 }
 
+
+rpm_safe_filename(){
+  local value="$1"
+  value="${value//[^A-Za-z0-9_.:+@%=-]/_}"
+  [[ -n "$value" ]] || value="unknown"
+  printf '%s\n' "$value"
+}
+
+rpm_dnf_dependency_diagnostics(){
+  local result="$1" effective_target="$2" log="$3" dep="$4" label="$5"
+  shift 5
+
+  local mock_args=("$@") diag_root diag_dir safe_dep safe_label
+  local providers_file missing_file provider missing safe provider_count missing_count
+
+  safe_dep="$(rpm_safe_filename "$dep")"
+  safe_label="$(rpm_safe_filename "$label")"
+  diag_root="$result/dnf-dependency-diagnostics"
+  diag_dir="$diag_root/$safe_label-$safe_dep"
+  mkdir -p "$diag_dir"
+
+  {
+    echo
+    echo "=== generic DNF dependency diagnostics ==="
+    echo "label=$label"
+    echo "dependency=$dep"
+    echo "effective_target=$effective_target"
+    echo "diagnostics_dir=${diag_dir#$result/}"
+  } | tee -a "$log" >&2
+
+  mock -r "$effective_target" "${mock_args[@]}" \
+    --pm-cmd repoquery --whatprovides "$dep" \
+    >"$diag_dir/whatprovides-dependency.txt" 2>&1 || true
+
+  mock -r "$effective_target" "${mock_args[@]}" \
+    --pm-cmd repoquery --whatprovides --showduplicates "$dep" \
+    >"$diag_dir/whatprovides-dependency-showduplicates.txt" 2>&1 || true
+
+  mock -r "$effective_target" "${mock_args[@]}" \
+    --pm-cmd repoquery --qf '%{name}' --whatprovides "$dep" \
+    >"$diag_dir/provider-names.raw.txt" 2>&1 || true
+
+  providers_file="$diag_dir/provider-names.txt"
+  awk '
+    /^[[:space:]]*$/ { next }
+    /^Last metadata expiration check:/ { next }
+    /^No matching Packages/ { next }
+    /^Error:/ { next }
+    /^Unable to/ { next }
+    /^[A-Za-z0-9_.:+@%-]+$/ { print }
+  ' "$diag_dir/provider-names.raw.txt" | sort -u >"$providers_file"
+
+  # Fall back to parsing normal repoquery output if queryformat is unavailable
+  # or if the active package manager returns full NEVRAs despite --qf.
+  if [[ ! -s "$providers_file" ]]; then
+    awk '
+      /^[[:space:]]*$/ { next }
+      /^Last metadata expiration check:/ { next }
+      /^No matching Packages/ { next }
+      /^Error:/ { next }
+      /^Unable to/ { next }
+      {
+        item=$1
+        sub(/\.[A-Za-z0-9_]+$/, "", item)
+        n=split(item, parts, "-")
+        if (n >= 3) {
+          name=parts[1]
+          for (i=2; i<=n-2; i++) name=name "-" parts[i]
+          print name
+        } else {
+          print item
+        }
+      }
+    ' "$diag_dir/whatprovides-dependency.txt" | sort -u >"$providers_file"
+  fi
+
+  provider_count="$(awk 'NF { count++ } END { print count + 0 }' "$providers_file")"
+
+  while IFS= read -r provider; do
+    [[ -n "$provider" ]] || continue
+    safe="$(rpm_safe_filename "$provider")"
+
+    mock -r "$effective_target" "${mock_args[@]}" \
+      --pm-cmd repoquery --available --showduplicates "$provider" \
+      >"$diag_dir/showduplicates-$safe.txt" 2>&1 || true
+
+    mock -r "$effective_target" "${mock_args[@]}" \
+      --pm-cmd repoquery --requires "$provider" \
+      >"$diag_dir/requires-$safe.txt" 2>&1 || true
+
+    mock -r "$effective_target" "${mock_args[@]}" \
+      --pm-cmd repoquery --requires --resolve "$provider" \
+      >"$diag_dir/requires-resolve-$safe.txt" 2>&1 || true
+  done <"$providers_file"
+
+  missing_file="$diag_dir/missing-capabilities.txt"
+  grep -Eo 'nothing provides [^[:space:]]+' "$log" \
+    | sed -E 's/^nothing provides //' \
+    | sort -u >"$missing_file" || true
+
+  missing_count="$(awk 'NF { count++ } END { print count + 0 }' "$missing_file")"
+
+  while IFS= read -r missing; do
+    [[ -n "$missing" ]] || continue
+    safe="$(rpm_safe_filename "$missing")"
+
+    mock -r "$effective_target" "${mock_args[@]}" \
+      --pm-cmd repoquery --whatprovides "$missing" \
+      >"$diag_dir/whatprovides-missing-$safe.txt" 2>&1 || true
+
+    mock -r "$effective_target" "${mock_args[@]}" \
+      --pm-cmd repoquery --whatprovides --showduplicates "$missing" \
+      >"$diag_dir/whatprovides-missing-showduplicates-$safe.txt" 2>&1 || true
+  done <"$missing_file"
+
+  {
+    echo "provider_count=$provider_count"
+    if [[ "$provider_count" -gt 0 ]]; then
+      echo "providers:"
+      sed 's/^/  - /' "$providers_file"
+    else
+      echo "providers: none found"
+    fi
+    echo "missing_capability_count=$missing_count"
+    if [[ "$missing_count" -gt 0 ]]; then
+      echo "missing_capabilities:"
+      sed 's/^/  - /' "$missing_file"
+    else
+      echo "missing_capabilities: none found in install log so far"
+    fi
+    echo "diagnostic_files:"
+    find "$diag_dir" -maxdepth 1 -type f -printf '  - %f\n' | sort
+  } | tee -a "$log" >&2
+}
+
 rpm_install_buildrequires_stepwise(){
   local result="$1" msg="$2" target="$3" phase="$4" srpm="$5"
   shift 5
@@ -607,6 +742,8 @@ rpm_install_buildrequires_stepwise(){
         echo "mock -r $effective_target ... --pm-cmd install ${retry_flags[*]} $dep"
       } | tee -a "$log" >&2
 
+      rpm_dnf_dependency_diagnostics "$result" "$effective_target" "$log" "$dep" "normal-install-failed" "${mock_args[@]}"
+
       if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd install "${retry_flags[@]}" "$dep" >>"$log" 2>&1; then
         {
           echo "status=installed-after-allowerasing"
@@ -621,6 +758,8 @@ rpm_install_buildrequires_stepwise(){
           echo "normal_install_failed=true"
           echo "allowerasing_retry_failed=true"
         } >>"$log"
+
+        rpm_dnf_dependency_diagnostics "$result" "$effective_target" "$log" "$dep" "allowerasing-retry-failed" "${mock_args[@]}"
 
         rpm_stepwise_buildrequires_failure_report "$result" "$log"
         rpm_dump_mock_failure "$result" "$msg"
