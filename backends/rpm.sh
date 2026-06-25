@@ -662,62 +662,108 @@ rpm_dnf_dependency_diagnostics(){
 }
 
 
+rpm_mock_config_debug_dump(){
+  local log="$1" cfg="$2" depth="${3:-0}" file dir include inc_path
+
+  [[ -n "$cfg" ]] || return 0
+  [[ "$depth" -le 4 ]] || {
+    echo "config_include_depth_limit_reached=$cfg" | tee -a "$log" >&2
+    return 0
+  }
+
+  if [[ ! -f "$cfg" ]]; then
+    {
+      echo
+      echo "--- missing mock config: $cfg ---"
+    } | tee -a "$log" >&2
+    return 0
+  fi
+
+  {
+    echo
+    echo "--- mock config: $cfg ---"
+    cat "$cfg"
+  } | tee -a "$log" >&2
+
+  dir="$(dirname "$cfg")"
+  while IFS= read -r include; do
+    [[ -n "$include" ]] || continue
+    if [[ "$include" = /* ]]; then
+      inc_path="$include"
+    else
+      inc_path="$dir/$include"
+      [[ -f "$inc_path" ]] || inc_path="/etc/mock/$include"
+    fi
+    rpm_mock_config_debug_dump "$log" "$inc_path" $((depth + 1))
+  done < <(
+    sed -nE "s/^[[:space:]]*include\(['\"]([^'\"]+)['\"]\).*/\1/p" "$cfg" | awk 'NF && !seen[$0]++'
+  )
+}
+
+rpm_debug_dump_file(){
+  local log="$1" title="$2" file="$3"
+  {
+    echo
+    echo "=== $title ==="
+    if [[ -f "$file" ]]; then
+      cat "$file"
+    else
+      echo "missing_file=$file"
+    fi
+  } | tee -a "$log" >&2
+}
+
 rpm_mock_repo_debug(){
   local result="$1" target="$2" effective_target="$3" label="$4"
   shift 4
 
-  local mock_args=("$@") diag_dir log cfg root family arch rel file status
+  local mock_args=("$@") diag_dir log root family arch rel file status cfg
 
   mkdir -p "$result"
   diag_dir="$result/mock-repo-debug"
   mkdir -p "$diag_dir"
   log="$diag_dir/$label.log"
+  : >"$log"
 
   {
     echo "=== mock repository debug ==="
     echo "label=$label"
+    echo "target=$target"
     echo "effective_target=$effective_target"
     echo "mock_args=${mock_args[*]}"
+    echo "debug_dir=${diag_dir#$result/}"
     echo
+    echo "=== generated and included mock config tree ==="
+  } | tee -a "$log" >&2
 
-    echo "=== mock config files ==="
-    for cfg in "/etc/mock/$effective_target.cfg"; do
-      if [[ -f "$cfg" ]]; then
-        echo "--- $cfg ---"
-        cat "$cfg"
-        echo
-      else
-        echo "missing: $cfg"
-      fi
-    done
-    echo
+  rpm_mock_config_debug_dump "$log" "/etc/mock/$effective_target.cfg" 0
 
-    if [[ "$effective_target" == *-layered ]]; then
-      echo "=== included base config reference ==="
-      grep -E "^include\(" "/etc/mock/$effective_target.cfg" 2>/dev/null || true
+  root="${RPM_LAYER_ROOT:-}"
+  if [[ -n "$root" && -d "$root" ]]; then
+    {
       echo
-    fi
-
-    root="${RPM_LAYER_ROOT:-}"
-    if [[ -n "$root" && -d "$root" ]]; then
       echo "=== layered repo fragments visible to this source ==="
-      IFS=$'\t' read -r family arch < <(split_target "$target") || true
-      if [[ -n "${family:-}" ]]; then
-        while IFS= read -r file; do
-          [[ -n "$file" ]] || continue
-          rel="${file#$root/}"
-          echo "--- $rel ---"
-          cat "$file"
+    } | tee -a "$log" >&2
+    IFS=$'\t' read -r family arch < <(split_target "$target") || true
+    if [[ -n "${family:-}" ]]; then
+      while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        rel="${file#$root/}"
+        {
           echo
-        done < <(layered_files "$root" "$family" "$target" 'repos/*.repo')
-      fi
+          echo "--- layered repo fragment: $rel ---"
+          cat "$file"
+        } | tee -a "$log" >&2
+      done < <(layered_files "$root" "$family" "$target" 'repos/*.repo')
     fi
-  } >"$log"
+  else
+    echo "layered_repo_fragments=not_checked_no_RPM_LAYER_ROOT" | tee -a "$log" >&2
+  fi
 
   {
     echo
     echo "=== mock --pm-cmd repolist --all ==="
-  } >>"$log"
+  } | tee -a "$log" >&2
   if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist --all >>"$log" 2>&1; then
     echo "repolist_all_status=0" >>"$log"
   else
@@ -725,11 +771,28 @@ rpm_mock_repo_debug(){
     echo "repolist_all_status=$status" >>"$log"
     echo "note=repolist may fail before the chroot/package-manager environment exists; continuing" >>"$log"
   fi
+  tail -n +1 "$log" >/dev/null
+  {
+    echo
+    echo "--- repolist --all output above was written to ${log#$result/} ---"
+  } >&2
+
+  {
+    echo
+    echo "=== mock --pm-cmd repolist --enabled ==="
+  } | tee -a "$log" >&2
+  if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist --enabled >>"$log" 2>&1; then
+    echo "repolist_enabled_status=0" >>"$log"
+  else
+    status=$?
+    echo "repolist_enabled_status=$status" >>"$log"
+    echo "note=enabled repolist may not be supported by the active package manager; continuing" >>"$log"
+  fi
 
   {
     echo
     echo "=== mock --pm-cmd repolist -v ==="
-  } >>"$log"
+  } | tee -a "$log" >&2
   if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist -v >>"$log" 2>&1; then
     echo "repolist_verbose_status=0" >>"$log"
   else
@@ -738,15 +801,24 @@ rpm_mock_repo_debug(){
     echo "note=verbose repolist may not be supported by the active package manager; continuing" >>"$log"
   fi
 
+  {
+    echo
+    echo "=== mock repo debug complete ==="
+    echo "mock_repo_debug_log=${log#$result/}"
+  } | tee -a "$log" >&2
 
-  echo "mock_repo_debug_log=${log#$result/}" >&2
+  # Print the complete file into the job log. This is intentionally verbose:
+  # it makes CI logs self-contained, so callers do not have to download the
+  # artifact to see which repos, URLs, priorities and config fragments were used.
+  echo "--- begin ${log#$result/} ---" >&2
+  cat "$log" >&2 || true
+  echo "--- end ${log#$result/} ---" >&2
 }
-
 rpm_buildrequires_provider_debug(){
   local result="$1" effective_target="$2" log="$3" deps_file="$4" label="$5"
   shift 5
 
-  local mock_args=("$@") diag_dir dep safe status
+  local mock_args=("$@") diag_dir dep safe status out_file qf_file
 
   [[ -f "$deps_file" ]] || return 0
   diag_dir="$result/mock-repo-debug/buildrequires-providers-$label"
@@ -758,44 +830,49 @@ rpm_buildrequires_provider_debug(){
     echo "label=$label"
     echo "effective_target=$effective_target"
     echo "diagnostics_dir=${diag_dir#$result/}"
+    echo "format=name<TAB>evr<TAB>arch<TAB>repoid<TAB>location"
   } | tee -a "$log" >&2
 
   while IFS= read -r dep; do
     [[ -n "$dep" ]] || continue
     safe="$(rpm_safe_filename "$dep")"
+    out_file="$diag_dir/whatprovides-$safe.txt"
+    qf_file="$diag_dir/whatprovides-qf-$safe.txt"
 
     {
       echo
       echo "--- dependency: $dep ---"
-      echo "whatprovides_file=buildrequires-providers-$label/whatprovides-$safe.txt"
-      echo "whatprovides_qf_file=buildrequires-providers-$label/whatprovides-qf-$safe.txt"
-    } >>"$log"
+      echo "whatprovides_file=${out_file#$result/}"
+      echo "whatprovides_qf_file=${qf_file#$result/}"
+    } | tee -a "$log" >&2
 
     if mock -r "$effective_target" "${mock_args[@]}" \
       --pm-cmd repoquery --whatprovides --showduplicates --location "$dep" \
-      >"$diag_dir/whatprovides-$safe.txt" 2>&1; then
+      >"$out_file" 2>&1; then
       status=0
     else
       status=$?
     fi
-    echo "whatprovides_status=$status" >>"$log"
+    echo "whatprovides_status=$status" | tee -a "$log" >&2
+    rpm_debug_dump_file "$log" "repoquery --whatprovides --showduplicates --location $dep" "$out_file"
 
     if mock -r "$effective_target" "${mock_args[@]}" \
       --pm-cmd repoquery --whatprovides --showduplicates --qf '%{name}\t%{evr}\t%{arch}\t%{repoid}\t%{location}' "$dep" \
-      >"$diag_dir/whatprovides-qf-$safe.txt" 2>&1; then
+      >"$qf_file" 2>&1; then
       status=0
     else
       status=$?
     fi
-    echo "whatprovides_qf_status=$status" >>"$log"
+    echo "whatprovides_qf_status=$status" | tee -a "$log" >&2
+    rpm_debug_dump_file "$log" "repoquery --whatprovides --showduplicates --qf for $dep" "$qf_file"
   done <"$deps_file"
 
   {
-    echo "provider_debug_files:"
+    echo
+    echo "=== provider debug files ==="
     find "$diag_dir" -maxdepth 1 -type f -printf '  - %f\n' | sort
   } | tee -a "$log" >&2
 }
-
 rpm_install_buildrequires_stepwise(){
   local result="$1" msg="$2" target="$3" phase="$4" srpm="$5"
   shift 5
