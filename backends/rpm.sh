@@ -317,7 +317,7 @@ rpm_diagnostic_write_failure_focus_report(){
 
 rpm_layered_repo_config_args(){
   local target="$1" family="$2" root="$3"
-  local -n out_args="$4"
+  local -n repo_args_ref="$4"
   local repo_files=() cfg_dir cfg_file safe_source file
 
   [[ -n "$root" && -d "$root" ]] || return 0
@@ -342,7 +342,7 @@ rpm_layered_repo_config_args(){
     printf "'''\n"
   } >"$cfg_file"
 
-  out_args+=(--configdir "$cfg_dir")
+  repo_args_ref+=(--configdir "$cfg_dir")
 }
 
 rpm_mock_args_array(){
@@ -366,7 +366,7 @@ rpm_mock_args_array(){
     out_args+=(--config-opts "chroot_setup_cmd=$TARGET_RPM_CHROOT_SETUP_CMD")
   fi
 
-  rpm_layered_repo_config_args "$target" "$family" "$repo_root" out_args
+  rpm_layered_repo_config_args "$target" "$family" "$repo_root" "$3"
 }
 
 rpm_mock_with_args(){
