@@ -531,6 +531,7 @@ rpm_install_buildrequires_stepwise(){
   local common_args=("$@") target_args=() mock_args=() effective_target
   local deps_file log dep status index total
   local install_flags=(-y --setopt=tsflags=noscripts,notriggers)
+  local retry_flags=(-y --allowerasing --setopt=tsflags=noscripts,notriggers)
 
   mkdir -p "$result"
   deps_file="$result/stepwise-buildrequires.txt"
@@ -557,6 +558,7 @@ rpm_install_buildrequires_stepwise(){
     echo "dependencies=$deps_file"
     echo "count=$total"
     echo "strategy=mock --pm-cmd install ${install_flags[*]} <BuildRequires-entry>"
+    echo "retry_strategy=on failure only: mock --pm-cmd install ${retry_flags[*]} <BuildRequires-entry>"
     echo "target_args=${target_args[*]}"
     echo "common_args=${common_args[*]}"
     echo
@@ -597,16 +599,35 @@ rpm_install_buildrequires_stepwise(){
       status=$?
       {
         echo
-        echo "=== failed BuildRequires dependency ==="
+        echo "=== normal BuildRequires install failed ==="
         echo "dependency=$dep"
         echo "exit_status=$status"
-      } >>"$log"
+        echo "retry=true"
+        echo "retry_strategy=mock --pm-cmd install ${retry_flags[*]} <BuildRequires-entry>"
+        echo "mock -r $effective_target ... --pm-cmd install ${retry_flags[*]} $dep"
+      } | tee -a "$log" >&2
 
-      rpm_stepwise_buildrequires_failure_report "$result" "$log"
-      rpm_dump_mock_failure "$result" "$msg"
-      echo "--- ${log#$result/} ---" >&2
-      cat "$log" >&2 || true
-      die "$msg; failed while installing BuildRequires entry: $dep"
+      if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd install "${retry_flags[@]}" "$dep" >>"$log" 2>&1; then
+        {
+          echo "status=installed-after-allowerasing"
+        } >>"$log"
+      else
+        status=$?
+        {
+          echo
+          echo "=== failed BuildRequires dependency ==="
+          echo "dependency=$dep"
+          echo "exit_status=$status"
+          echo "normal_install_failed=true"
+          echo "allowerasing_retry_failed=true"
+        } >>"$log"
+
+        rpm_stepwise_buildrequires_failure_report "$result" "$log"
+        rpm_dump_mock_failure "$result" "$msg"
+        echo "--- ${log#$result/} ---" >&2
+        cat "$log" >&2 || true
+        die "$msg; failed while installing BuildRequires entry: $dep"
+      fi
     fi
   done <"$deps_file"
 
