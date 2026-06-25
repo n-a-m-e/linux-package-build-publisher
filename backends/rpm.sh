@@ -315,22 +315,25 @@ rpm_diagnostic_write_failure_focus_report(){
   } >>"$log"
 }
 
-rpm_layered_repo_config_args(){
-  local target="$1" family="$2" root="$3"
-  local -n repo_args_ref="$4"
-  local repo_files=() cfg_dir cfg_file safe_source file
+rpm_effective_mock_target(){
+  local target="$1" family arch root="${RPM_LAYER_ROOT:-}"
+  local repo_files=() cfg_file safe_source safe_target derived_target file
 
-  [[ -n "$root" && -d "$root" ]] || return 0
+  [[ -n "$root" && -d "$root" ]] || { printf '%s\n' "$target"; return 0; }
 
+  IFS=$'\t' read -r family arch < <(split_target "$target")
   mapfile -t repo_files < <(layered_files "$root" "$family" "$target" 'repos/*.repo')
-  ((${#repo_files[@]})) || return 0
+  ((${#repo_files[@]})) || { printf '%s\n' "$target"; return 0; }
+
+  [[ -f "/etc/mock/$target.cfg" ]] || die "Missing base mock config for layered repos: /etc/mock/$target.cfg"
 
   safe_source="${SOURCE_ID:-$PRIMARY_APP}"
   safe_source="${safe_source//[^A-Za-z0-9_.-]/_}"
-  cfg_dir="/work/mock-configs/$target/$safe_source"
-  cfg_file="$cfg_dir/$target.cfg"
-  mkdir -p "$cfg_dir"
+  safe_target="${target//[^A-Za-z0-9_.-]/_}"
+  derived_target="$safe_target-$safe_source-layered"
+  cfg_file="/etc/mock/$derived_target.cfg"
 
+  mkdir -p /etc/mock
   {
     printf "include('/etc/mock/%s.cfg')\n" "$target"
     printf "config_opts['dnf.conf'] += r'''\n"
@@ -342,11 +345,11 @@ rpm_layered_repo_config_args(){
     printf "'''\n"
   } >"$cfg_file"
 
-  repo_args_ref+=(--configdir "$cfg_dir")
+  printf '%s\n' "$derived_target"
 }
 
 rpm_mock_args_array(){
-  local target="$1" phase="$2" family arch repo_root="${RPM_LAYER_ROOT:-}"
+  local target="$1" phase="$2" family arch
   local -n out_args="$3"
 
   out_args=()
@@ -366,18 +369,18 @@ rpm_mock_args_array(){
     out_args+=(--config-opts "chroot_setup_cmd=$TARGET_RPM_CHROOT_SETUP_CMD")
   fi
 
-  rpm_layered_repo_config_args "$target" "$family" "$repo_root" "$3"
 }
 
 rpm_mock_with_args(){
   local result="$1" msg="$2" target="$3" phase="$4"
   shift 4
 
-  local mock_args=()
+  local mock_args=() effective_target
   rpm_mock_args_array "$target" "$phase" mock_args
+  effective_target="$(rpm_effective_mock_target "$target")"
 
   mkdir -p "$result"
-  if mock -r "$target" "${mock_args[@]}" "$@"; then
+  if mock -r "$effective_target" "${mock_args[@]}" "$@"; then
     return 0
   fi
 
@@ -389,7 +392,7 @@ rpm_mock_out_with_binds(){
   local result="$1" msg="$2" target="$3" phase="$4" bind_count="$5"
   shift 5
 
-  local mock_args=() bind_spec="[" separator="" host_path chroot_path out
+  local mock_args=() bind_spec="[" separator="" host_path chroot_path out effective_target
 
   while ((bind_count > 0)); do
     host_path="$1"
@@ -402,13 +405,14 @@ rpm_mock_out_with_binds(){
   bind_spec+="]"
 
   rpm_mock_args_array "$target" "$phase" mock_args
+  effective_target="$(rpm_effective_mock_target "$target")"
   mock_args+=(
     --enable-plugin bind_mount
     --plugin-option "bind_mount:dirs=$bind_spec"
   )
 
   mkdir -p "$result"
-  if out="$(mock -r "$target" "${mock_args[@]}" "$@" 2>&1)"; then
+  if out="$(mock -r "$effective_target" "${mock_args[@]}" "$@" 2>&1)"; then
     printf '%s
 ' "$out"
     return 0
@@ -524,7 +528,7 @@ rpm_install_buildrequires_stepwise(){
   local result="$1" msg="$2" target="$3" phase="$4" srpm="$5"
   shift 5
 
-  local common_args=("$@") target_args=() mock_args=()
+  local common_args=("$@") target_args=() mock_args=() effective_target
   local deps_file log dep status index total
   local install_flags=(-y --setopt=tsflags=noscripts,notriggers)
 
@@ -541,11 +545,13 @@ rpm_install_buildrequires_stepwise(){
   # rpm_mock_args_array(); dropping them here can accidentally re-enable mock's
   # bootstrap/tooling path or initialize a different root.
   rpm_mock_args_array "$target" "$phase" target_args
+  effective_target="$(rpm_effective_mock_target "$target")"
   mock_args=("${target_args[@]}" "${common_args[@]}")
 
   {
     echo "=== stepwise BuildRequires installation ==="
     echo "target=$target"
+    echo "effective_target=$effective_target"
     echo "phase=$phase"
     echo "srpm=$srpm"
     echo "dependencies=$deps_file"
@@ -580,10 +586,10 @@ rpm_install_buildrequires_stepwise(){
       echo
       echo "=== BuildRequires $index/$total ==="
       echo "dependency=$dep"
-      echo "mock -r $target ... --pm-cmd install ${install_flags[*]} $dep"
+      echo "mock -r $effective_target ... --pm-cmd install ${install_flags[*]} $dep"
     } | tee -a "$log" >&2
 
-    if mock -r "$target" "${mock_args[@]}" --pm-cmd install "${install_flags[@]}" "$dep" >>"$log" 2>&1; then
+    if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd install "${install_flags[@]}" "$dep" >>"$log" 2>&1; then
       {
         echo "status=installed"
       } >>"$log"
@@ -609,7 +615,7 @@ rpm_install_buildrequires_stepwise(){
     echo "=== all BuildRequires entries installed successfully ==="
   } >>"$log"
 
-  rpm_finalize_stepwise_buildroot "$result" "$target" "$log" "${mock_args[@]}"
+  rpm_finalize_stepwise_buildroot "$result" "$effective_target" "$log" "${mock_args[@]}"
 }
 
 rpm_build_srpm(){
