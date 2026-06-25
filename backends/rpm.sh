@@ -380,6 +380,7 @@ rpm_mock_with_args(){
   effective_target="$(rpm_effective_mock_target "$target")"
 
   mkdir -p "$result"
+  rpm_mock_repo_debug "$result" "$target" "$effective_target" "before-${phase}-mock-command" "${mock_args[@]}"
   if mock -r "$effective_target" "${mock_args[@]}" "$@"; then
     return 0
   fi
@@ -406,6 +407,7 @@ rpm_mock_out_with_binds(){
 
   rpm_mock_args_array "$target" "$phase" mock_args
   effective_target="$(rpm_effective_mock_target "$target")"
+  rpm_mock_repo_debug "$result" "$target" "$effective_target" "before-${phase}-mock-bind-command" "${mock_args[@]}"
   mock_args+=(
     --enable-plugin bind_mount
     --plugin-option "bind_mount:dirs=$bind_spec"
@@ -659,6 +661,141 @@ rpm_dnf_dependency_diagnostics(){
   } | tee -a "$log" >&2
 }
 
+
+rpm_mock_repo_debug(){
+  local result="$1" target="$2" effective_target="$3" label="$4"
+  shift 4
+
+  local mock_args=("$@") diag_dir log cfg root family arch rel file status
+
+  mkdir -p "$result"
+  diag_dir="$result/mock-repo-debug"
+  mkdir -p "$diag_dir"
+  log="$diag_dir/$label.log"
+
+  {
+    echo "=== mock repository debug ==="
+    echo "label=$label"
+    echo "effective_target=$effective_target"
+    echo "mock_args=${mock_args[*]}"
+    echo
+
+    echo "=== mock config files ==="
+    for cfg in "/etc/mock/$effective_target.cfg"; do
+      if [[ -f "$cfg" ]]; then
+        echo "--- $cfg ---"
+        cat "$cfg"
+        echo
+      else
+        echo "missing: $cfg"
+      fi
+    done
+    echo
+
+    if [[ "$effective_target" == *-layered ]]; then
+      echo "=== included base config reference ==="
+      grep -E "^include\(" "/etc/mock/$effective_target.cfg" 2>/dev/null || true
+      echo
+    fi
+
+    root="${RPM_LAYER_ROOT:-}"
+    if [[ -n "$root" && -d "$root" ]]; then
+      echo "=== layered repo fragments visible to this source ==="
+      IFS=$'\t' read -r family arch < <(split_target "$target") || true
+      if [[ -n "${family:-}" ]]; then
+        while IFS= read -r file; do
+          [[ -n "$file" ]] || continue
+          rel="${file#$root/}"
+          echo "--- $rel ---"
+          cat "$file"
+          echo
+        done < <(layered_files "$root" "$family" "$target" 'repos/*.repo')
+      fi
+    fi
+  } >"$log"
+
+  {
+    echo
+    echo "=== mock --pm-cmd repolist --all ==="
+  } >>"$log"
+  if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist --all >>"$log" 2>&1; then
+    echo "repolist_all_status=0" >>"$log"
+  else
+    status=$?
+    echo "repolist_all_status=$status" >>"$log"
+    echo "note=repolist may fail before the chroot/package-manager environment exists; continuing" >>"$log"
+  fi
+
+  {
+    echo
+    echo "=== mock --pm-cmd repolist -v ==="
+  } >>"$log"
+  if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist -v >>"$log" 2>&1; then
+    echo "repolist_verbose_status=0" >>"$log"
+  else
+    status=$?
+    echo "repolist_verbose_status=$status" >>"$log"
+    echo "note=verbose repolist may not be supported by the active package manager; continuing" >>"$log"
+  fi
+
+
+  echo "mock_repo_debug_log=${log#$result/}" >&2
+}
+
+rpm_buildrequires_provider_debug(){
+  local result="$1" effective_target="$2" log="$3" deps_file="$4" label="$5"
+  shift 5
+
+  local mock_args=("$@") diag_dir dep safe status
+
+  [[ -f "$deps_file" ]] || return 0
+  diag_dir="$result/mock-repo-debug/buildrequires-providers-$label"
+  mkdir -p "$diag_dir"
+
+  {
+    echo
+    echo "=== BuildRequires provider repository debug ==="
+    echo "label=$label"
+    echo "effective_target=$effective_target"
+    echo "diagnostics_dir=${diag_dir#$result/}"
+  } | tee -a "$log" >&2
+
+  while IFS= read -r dep; do
+    [[ -n "$dep" ]] || continue
+    safe="$(rpm_safe_filename "$dep")"
+
+    {
+      echo
+      echo "--- dependency: $dep ---"
+      echo "whatprovides_file=buildrequires-providers-$label/whatprovides-$safe.txt"
+      echo "whatprovides_qf_file=buildrequires-providers-$label/whatprovides-qf-$safe.txt"
+    } >>"$log"
+
+    if mock -r "$effective_target" "${mock_args[@]}" \
+      --pm-cmd repoquery --whatprovides --showduplicates --location "$dep" \
+      >"$diag_dir/whatprovides-$safe.txt" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+    echo "whatprovides_status=$status" >>"$log"
+
+    if mock -r "$effective_target" "${mock_args[@]}" \
+      --pm-cmd repoquery --whatprovides --showduplicates --qf '%{name}\t%{evr}\t%{arch}\t%{repoid}\t%{location}' "$dep" \
+      >"$diag_dir/whatprovides-qf-$safe.txt" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+    echo "whatprovides_qf_status=$status" >>"$log"
+  done <"$deps_file"
+
+  {
+    echo "provider_debug_files:"
+    find "$diag_dir" -maxdepth 1 -type f -printf '  - %f\n' | sort
+  } | tee -a "$log" >&2
+}
+
 rpm_install_buildrequires_stepwise(){
   local result="$1" msg="$2" target="$3" phase="$4" srpm="$5"
   shift 5
@@ -704,6 +841,9 @@ rpm_install_buildrequires_stepwise(){
     fi
     echo
   } >"$log"
+
+  rpm_mock_repo_debug "$result" "$target" "$effective_target" "before-stepwise-buildrequires" "${mock_args[@]}"
+  rpm_buildrequires_provider_debug "$result" "$effective_target" "$log" "$deps_file" "before-stepwise-buildrequires" "${mock_args[@]}"
 
   if [[ "$total" -eq 0 ]]; then
     {
