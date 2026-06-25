@@ -315,13 +315,48 @@ rpm_diagnostic_write_failure_focus_report(){
   } >>"$log"
 }
 
+rpm_layered_repo_config_args(){
+  local target="$1" family="$2" root="$3"
+  local -n out_args="$4"
+  local repo_files=() cfg_dir cfg_file safe_source file
+
+  [[ -n "$root" && -d "$root" ]] || return 0
+
+  mapfile -t repo_files < <(layered_files "$root" "$family" "$target" 'repos/*.repo')
+  ((${#repo_files[@]})) || return 0
+
+  safe_source="${SOURCE_ID:-$PRIMARY_APP}"
+  safe_source="${safe_source//[^A-Za-z0-9_.-]/_}"
+  cfg_dir="/work/mock-configs/$target/$safe_source"
+  cfg_file="$cfg_dir/$target.cfg"
+  mkdir -p "$cfg_dir"
+
+  {
+    printf "include('/etc/mock/%s.cfg')\n" "$target"
+    printf "config_opts['dnf.conf'] += r'''\n"
+    for file in "${repo_files[@]}"; do
+      printf '\n# layered repo fragment: %s\n' "${file#$root/}"
+      cat "$file"
+      printf '\n'
+    done
+    printf "'''\n"
+  } >"$cfg_file"
+
+  out_args+=(--configdir "$cfg_dir")
+}
+
 rpm_mock_args_array(){
-  local target="$1" phase="$2" family arch
+  local target="$1" phase="$2" family arch repo_root="${RPM_LAYER_ROOT:-}"
   local -n out_args="$3"
 
   out_args=()
   IFS=$'	' read -r family arch < <(split_target "$target")
   load_target rpm "$family" "$arch"
+
+  case "$phase" in
+    graph|build) ;;
+    *) die "Unknown mock phase: $phase" ;;
+  esac
 
   if [[ -n "${TARGET_RPM_MOCK_CONFIG_OPTS:-}" ]]; then
     read -r -a out_args <<<"$TARGET_RPM_MOCK_CONFIG_OPTS"
@@ -331,10 +366,7 @@ rpm_mock_args_array(){
     out_args+=(--config-opts "chroot_setup_cmd=$TARGET_RPM_CHROOT_SETUP_CMD")
   fi
 
-  case "$phase" in
-    graph|build) ;;
-    *) die "Unknown mock phase: $phase" ;;
-  esac
+  rpm_layered_repo_config_args "$target" "$family" "$repo_root" out_args
 }
 
 rpm_mock_with_args(){
@@ -863,6 +895,10 @@ rpm_queue_fingerprint(){
     while IFS= read -r file; do
       sha256_file "$file"
     done < <(layered_files "$root" "$family" "$target" 'replacements/*.sed')
+
+    while IFS= read -r file; do
+      sha256_file "$file"
+    done < <(layered_files "$root" "$family" "$target" 'repos/*.repo')
   } | sha256_lines
 }
 
@@ -898,12 +934,12 @@ rpm_build_queued(){
   spec_dir="$(dirname "$spec_path")"
   url="https://example.invalid/$SPEC"
 
-  rpm_fetch_sources_in_mock "$target" "$result" "$spec_dir" "$SPEC"
+  RPM_LAYER_ROOT="$root" rpm_fetch_sources_in_mock "$target" "$result" "$spec_dir" "$SPEC"
 
-  rpm_build_srpm "$target" "srpm-$target-$build_id" "$srpm_dir" "$spec_dir" "$spec_path" "$url"
+  RPM_LAYER_ROOT="$root" rpm_build_srpm "$target" "srpm-$target-$build_id" "$srpm_dir" "$spec_dir" "$spec_path" "$url"
   srpm="$(find "$srpm_dir" -maxdepth 1 -name '*.src.rpm' -print -quit)"
   [[ -n "$srpm" ]] || die "No SRPM created for $target/$build_id"
-  rpm_rebuild "$target" "$target-$build_id" "$result" "$local_repo" "$srpm" "$spec_path" "$url"
+  RPM_LAYER_ROOT="$root" rpm_rebuild "$target" "$target-$build_id" "$result" "$local_repo" "$srpm" "$spec_path" "$url"
   rm -f "$cache"/*.rpm "$cache"/*.src.rpm
   find "$result" -name '*.rpm' -type f -exec cp {} "$cache/" \;
   printf '%s' "$fp" >"$cache/.fingerprint"
