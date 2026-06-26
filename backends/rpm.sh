@@ -315,15 +315,102 @@ rpm_diagnostic_write_failure_focus_report(){
   } >>"$log"
 }
 
+rpm_layered_repo_files(){
+  local root="$1" family="$2" target="$3"
+  local layer pattern matches
+
+  while IFS= read -r layer; do
+    if [[ "$layer" == "." ]]; then
+      pattern="$root/repos/*.repo"
+    else
+      pattern="$root/$layer/repos/*.repo"
+    fi
+
+    if matches="$(compgen -G "$pattern")"; then
+      printf '%s\n' "$matches" | sort
+    fi
+  done < <(layer_names "$family" "$target")
+}
+
+rpm_expand_repo_fragment(){
+  local input="$1" output="$2" target="$3" family="$4" arch="$5" release="$6"
+  local content
+
+  content="$(cat "$input")"
+  content="${content//\{target\}/$target}"
+  content="${content//\{family\}/$family}"
+  content="${content//\{arch\}/$arch}"
+  content="${content//\{release\}/$release}"
+  content="${content//\{suffix\}/$release}"
+  printf '%s\n' "$content" >"$output"
+}
+
+rpm_repo_fragment_mode(){
+  local file="$1" mode
+
+  mode="$(sed -nE 's/^[[:space:]]*#[[:space:]]*builder-mode[[:space:]]*:[[:space:]]*([^[:space:]]+).*$/\1/p' "$file" | head -n 1 | tr '[:upper:]' '[:lower:]')"
+  [[ -n "$mode" ]] || mode="add"
+
+  case "$mode" in
+    add|replace) printf '%s' "$mode" ;;
+    *) die "Unsupported builder-mode '$mode' in repo fragment: $file" ;;
+  esac
+}
+
+rpm_repo_fragment_section_ids(){
+  local file="$1"
+
+  sed -nE 's/^[[:space:]]*\[([^]]+)\].*$/\1/p' "$file" | awk 'NF && !seen[$0]++'
+}
+
+rpm_repo_fragment_replace_ids(){
+  local file="$1" found=0 line
+
+  while IFS= read -r line; do
+    found=1
+    printf '%s\n' "$line"
+  done < <(
+    sed -nE 's/^[[:space:]]*#[[:space:]]*builder-replaces[[:space:]]*:[[:space:]]*(.*)$/\1/p' "$file" \
+      | awk '{ n = split($0, ids, /[[:space:],]+/); for (i = 1; i <= n; i++) if (ids[i] != "" && !seen[ids[i]]++) print ids[i] }'
+  )
+
+  if ! ((found)); then
+    rpm_repo_fragment_section_ids "$file"
+  fi
+}
+
+rpm_python_single_quote(){
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\'/\\\'}"
+  printf "'%s'" "$value"
+}
+
+rpm_write_repo_fragment_append(){
+  local cfg_file="$1" title="$2" fragment="$3"
+
+  {
+    printf "\nconfig_opts['dnf.conf'] += r'''\n"
+    printf '\n# layered repo fragment: %s\n' "$title"
+    cat "$fragment"
+    printf '\n'
+    printf "'''\n"
+  } >>"$cfg_file"
+}
+
 rpm_effective_mock_target(){
   local target="$1" family arch root="${RPM_LAYER_ROOT:-}"
   local repo_files=() cfg_file safe_source safe_target derived_target file
+  local release tmp_dir expanded mode replace_id rel
 
   [[ -n "$root" && -d "$root" ]] || { printf '%s\n' "$target"; return 0; }
 
   IFS=$'\t' read -r family arch < <(split_target "$target")
-  mapfile -t repo_files < <(layered_files "$root" "$family" "$target" 'repos/*.repo')
+  mapfile -t repo_files < <(rpm_layered_repo_files "$root" "$family" "$target")
   ((${#repo_files[@]})) || { printf '%s\n' "$target"; return 0; }
+
+  load_target rpm "$family" "$arch"
+  release="${family#"${TARGET_LABEL_STRIP_PREFIX:-}"}"
 
   [[ -f "/etc/mock/$target.cfg" ]] || die "Missing base mock config for layered repos: /etc/mock/$target.cfg"
 
@@ -332,18 +419,47 @@ rpm_effective_mock_target(){
   safe_target="${target//[^A-Za-z0-9_.-]/_}"
   derived_target="$safe_target-$safe_source-layered"
   cfg_file="/etc/mock/$derived_target.cfg"
+  tmp_dir="/tmp/repository-builder-repos-$derived_target"
 
-  mkdir -p /etc/mock
+  rm -rf "$tmp_dir"
+  mkdir -p /etc/mock "$tmp_dir"
+
   {
     printf "include('/etc/mock/%s.cfg')\n" "$target"
-    printf "config_opts['dnf.conf'] += r'''\n"
-    for file in "${repo_files[@]}"; do
-      printf '\n# layered repo fragment: %s\n' "${file#$root/}"
-      cat "$file"
-      printf '\n'
-    done
-    printf "'''\n"
+    cat <<'PYCODE'
+
+import re
+
+def _repository_builder_remove_repo_section(conf, repo_id):
+    pattern = r'(?ms)^\[' + re.escape(repo_id) + r'\]\n.*?(?=^\[|\Z)'
+    return re.sub(pattern, '', conf).strip() + '\n'
+PYCODE
   } >"$cfg_file"
+
+  for file in "${repo_files[@]}"; do
+    rel="${file#$root/}"
+    expanded="$tmp_dir/${rel//\//__}"
+    rpm_expand_repo_fragment "$file" "$expanded" "$target" "$family" "$arch" "$release"
+    mode="$(rpm_repo_fragment_mode "$expanded")"
+
+    {
+      printf '\n# repository-builder repo fragment metadata\n'
+      printf '# source: %s\n' "$rel"
+      printf '# mode: %s\n' "$mode"
+    } >>"$cfg_file"
+
+    if [[ "$mode" == "replace" ]]; then
+      while IFS= read -r replace_id; do
+        [[ -n "$replace_id" ]] || continue
+        printf "config_opts['dnf.conf'] = _repository_builder_remove_repo_section(config_opts['dnf.conf'], " >>"$cfg_file"
+        rpm_python_single_quote "$replace_id" >>"$cfg_file"
+        printf ")\n" >>"$cfg_file"
+        printf '# replaces: %s\n' "$replace_id" >>"$cfg_file"
+      done < <(rpm_repo_fragment_replace_ids "$expanded")
+    fi
+
+    rpm_write_repo_fragment_append "$cfg_file" "$rel" "$expanded"
+  done
 
   printf '%s\n' "$derived_target"
 }
@@ -754,7 +870,7 @@ rpm_mock_repo_debug(){
           echo "--- layered repo fragment: $rel ---"
           cat "$file"
         } | tee -a "$log" >&2
-      done < <(layered_files "$root" "$family" "$target" 'repos/*.repo')
+      done < <(rpm_layered_repo_files "$root" "$family" "$target")
     fi
   else
     echo "layered_repo_fragments=not_checked_no_RPM_LAYER_ROOT" | tee -a "$log" >&2
@@ -1281,7 +1397,7 @@ rpm_queue_fingerprint(){
 
     while IFS= read -r file; do
       sha256_file "$file"
-    done < <(layered_files "$root" "$family" "$target" 'repos/*.repo')
+    done < <(rpm_layered_repo_files "$root" "$family" "$target")
   } | sha256_lines
 }
 
