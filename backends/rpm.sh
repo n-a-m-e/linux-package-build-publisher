@@ -352,7 +352,7 @@ rpm_repo_fragment_mode(){
   [[ -n "$mode" ]] || mode="add"
 
   case "$mode" in
-    add|replace) printf '%s' "$mode" ;;
+    add|replace|replace-section) printf '%s' "$mode" ;;
     *) die "Unsupported builder-mode '$mode' in repo fragment: $file" ;;
   esac
 }
@@ -401,7 +401,8 @@ rpm_write_repo_fragment_append(){
 rpm_effective_mock_target(){
   local target="$1" family arch root="${RPM_LAYER_ROOT:-}"
   local repo_files=() cfg_file safe_source safe_target derived_target file
-  local release tmp_dir expanded mode replace_id rel
+  local release tmp_dir expanded mode replace_id rel first
+  local replace_ids=()
 
   [[ -n "$root" && -d "$root" ]] || { printf '%s\n' "$target"; return 0; }
 
@@ -433,6 +434,107 @@ import re
 def _repository_builder_remove_repo_section(conf, repo_id):
     pattern = r'(?ms)^\[' + re.escape(repo_id) + r'\]\n.*?(?=^\[|\Z)'
     return re.sub(pattern, '', conf).strip() + '\n'
+
+def _repository_builder_fragment_sections(fragment):
+    sections = []
+    current_id = None
+    current_lines = []
+
+    for line in fragment.splitlines():
+        match = re.match(r'^\s*\[([^]]+)\]\s*$', line)
+        if match:
+            if current_id is not None:
+                sections.append((current_id, current_lines))
+            current_id = match.group(1).strip()
+            current_lines = []
+        elif current_id is not None:
+            current_lines.append(line)
+
+    if current_id is not None:
+        sections.append((current_id, current_lines))
+
+    return sections
+
+def _repository_builder_parse_repo_key_values(lines):
+    order = []
+    values = {}
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#') or stripped.startswith(';'):
+            continue
+
+        match = re.match(r'^\s*([^=:#][^=]*?)\s*=\s*(.*?)\s*$', line)
+        if not match:
+            continue
+
+        key = match.group(1).strip()
+        value = match.group(2)
+        if key not in values:
+            order.append(key)
+        values[key] = value
+
+    return order, values
+
+def _repository_builder_render_repo_section(repo_id, order, values):
+    rendered = ['[' + repo_id + ']']
+    for key in order:
+        if key in values:
+            rendered.append(key + '=' + values[key])
+    return '\n'.join(rendered).rstrip() + '\n'
+
+def _repository_builder_merge_repo_section(conf, repo_id, replacement_lines):
+    pattern = r'(?ms)^\[' + re.escape(repo_id) + r'\]\n.*?(?=^\[|\Z)'
+    match = re.search(pattern, conf)
+
+    if match:
+        existing_section = match.group(0).splitlines()[1:]
+        order, values = _repository_builder_parse_repo_key_values(existing_section)
+    else:
+        order, values = [], {}
+
+    replacement_order, replacement_values = _repository_builder_parse_repo_key_values(replacement_lines)
+
+    for key in replacement_order:
+        value = replacement_values[key]
+        # Empty values in a replacement fragment mean "remove this inherited key".
+        # This is useful for switching from mirrorlist/metalink to baseurl while
+        # preserving unrelated defaults such as gpgkey.
+        if value == '':
+            values.pop(key, None)
+            order = [item for item in order if item != key]
+            continue
+
+        if key not in values:
+            order.append(key)
+        values[key] = value
+
+    rendered = _repository_builder_render_repo_section(repo_id, order, values)
+
+    if match:
+        return (conf[:match.start()] + rendered + conf[match.end():]).strip() + '\n'
+
+    return conf.rstrip() + '\n\n' + rendered
+
+def _repository_builder_merge_repo_fragment(conf, fragment, replace_ids):
+    sections = _repository_builder_fragment_sections(fragment)
+    if not sections:
+        return conf
+
+    if not replace_ids:
+        replace_ids = [section_id for section_id, _lines in sections]
+
+    if len(sections) == 1:
+        _section_id, lines = sections[0]
+        for repo_id in replace_ids:
+            conf = _repository_builder_merge_repo_section(conf, repo_id, lines)
+        return conf
+
+    for index, (section_id, lines) in enumerate(sections):
+        repo_id = replace_ids[index] if index < len(replace_ids) else section_id
+        conf = _repository_builder_merge_repo_section(conf, repo_id, lines)
+
+    return conf
 PYCODE
   } >"$cfg_file"
 
@@ -448,17 +550,38 @@ PYCODE
       printf '# mode: %s\n' "$mode"
     } >>"$cfg_file"
 
-    if [[ "$mode" == "replace" ]]; then
-      while IFS= read -r replace_id; do
-        [[ -n "$replace_id" ]] || continue
-        printf "config_opts['dnf.conf'] = _repository_builder_remove_repo_section(config_opts['dnf.conf'], " >>"$cfg_file"
-        rpm_python_single_quote "$replace_id" >>"$cfg_file"
-        printf ")\n" >>"$cfg_file"
-        printf '# replaces: %s\n' "$replace_id" >>"$cfg_file"
-      done < <(rpm_repo_fragment_replace_ids "$expanded")
-    fi
+    case "$mode" in
+      replace)
+        mapfile -t replace_ids < <(rpm_repo_fragment_replace_ids "$expanded")
+        for replace_id in "${replace_ids[@]}"; do
+          [[ -n "$replace_id" ]] || continue
+          printf '# merges-replaces: %s\n' "$replace_id" >>"$cfg_file"
+        done
 
-    rpm_write_repo_fragment_append "$cfg_file" "$rel" "$expanded"
+        printf "config_opts['dnf.conf'] = _repository_builder_merge_repo_fragment(config_opts['dnf.conf'], r'''\n" >>"$cfg_file"
+        cat "$expanded" >>"$cfg_file"
+        printf "\n''', [" >>"$cfg_file"
+        first=1
+        for replace_id in "${replace_ids[@]}"; do
+          [[ -n "$replace_id" ]] || continue
+          if ((first)); then first=0; else printf ', ' >>"$cfg_file"; fi
+          rpm_python_single_quote "$replace_id" >>"$cfg_file"
+        done
+        printf "])\n" >>"$cfg_file"
+        ;;&
+      replace-section)
+        while IFS= read -r replace_id; do
+          [[ -n "$replace_id" ]] || continue
+          printf "config_opts['dnf.conf'] = _repository_builder_remove_repo_section(config_opts['dnf.conf'], " >>"$cfg_file"
+          rpm_python_single_quote "$replace_id" >>"$cfg_file"
+          printf ")\n" >>"$cfg_file"
+          printf '# replaces-section: %s\n' "$replace_id" >>"$cfg_file"
+        done < <(rpm_repo_fragment_replace_ids "$expanded")
+        ;;&
+      add|replace-section)
+        rpm_write_repo_fragment_append "$cfg_file" "$rel" "$expanded"
+        ;;
+    esac
   done
 
   printf '%s\n' "$derived_target"
