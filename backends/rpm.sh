@@ -379,30 +379,222 @@ rpm_repo_fragment_replace_ids(){
   fi
 }
 
-rpm_python_single_quote(){
-  local value="$1"
-  value="${value//\\/\\\\}"
-  value="${value//\'/\\\'}"
-  printf "'%s'" "$value"
+rpm_mock_config_resolve_include(){
+  local current_dir="$1" include_ref="$2"
+
+  if [[ "$include_ref" == /* ]]; then
+    printf '%s\n' "$include_ref"
+  elif [[ -f "$current_dir/$include_ref" ]]; then
+    printf '%s\n' "$current_dir/$include_ref"
+  elif [[ -f "/etc/mock/$include_ref" ]]; then
+    printf '%s\n' "/etc/mock/$include_ref"
+  else
+    printf '%s\n' "$current_dir/$include_ref"
+  fi
 }
 
-rpm_write_repo_fragment_append(){
-  local cfg_file="$1" title="$2" fragment="$3"
+rpm_mock_config_render_text(){
+  local target="$1" arch="$2" text="$3"
+
+  text="${text//\{\{ target_arch \}\}/$arch}"
+  text="${text//\{\{target_arch\}\}/$arch}"
+  text="${text//\{\{ arch \}\}/$arch}"
+  text="${text//\{\{arch\}\}/$arch}"
+  text="${text//\{\{ root \}\}/$target}"
+  text="${text//\{\{root\}\}/$target}"
+  printf '%s\n' "$text"
+}
+
+rpm_mock_config_extract_dnf_file(){
+  local file="$1" target="$2" arch="$3" current_dir line include_ref include_file op delimiter rest block
+
+  [[ -f "$file" ]] || return 0
+  current_dir="$(dirname "$file")"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ include\([\"\']([^\"\']+)[\"\']\) ]]; then
+      include_ref="${BASH_REMATCH[1]}"
+      include_file="$(rpm_mock_config_resolve_include "$current_dir" "$include_ref")"
+      rpm_mock_config_extract_dnf_file "$include_file" "$target" "$arch"
+      continue
+    fi
+
+    [[ "$line" == *"config_opts['dnf.conf']"* ]] || continue
+    if [[ "$line" == *"+="* ]]; then
+      op="append"
+    elif [[ "$line" == *"="* ]]; then
+      op="set"
+    else
+      continue
+    fi
+
+    delimiter=""
+    case "$line" in
+      *"'''"*) delimiter="'''" ;;
+      *'"""'*) delimiter='"""' ;;
+      *) continue ;;
+    esac
+
+    rest="${line#*${delimiter}}"
+    block=""
+    if [[ "$rest" == *"$delimiter"* ]]; then
+      block="${rest%%$delimiter*}"
+    else
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == *"$delimiter"* ]]; then
+          block+="${line%%$delimiter*}"
+          break
+        fi
+        block+="$line"$'\n'
+      done
+    fi
+
+    printf '\n__REPOSITORY_BUILDER_DNF_OP_%s__\n' "$op"
+    rpm_mock_config_render_text "$target" "$arch" "$block"
+  done <"$file"
+}
+
+rpm_mock_base_dnf_conf(){
+  local target="$1" arch="$2" base_cfg="/etc/mock/$target.cfg" stream line tmp out
+
+  [[ -f "$base_cfg" ]] || die "Missing base mock config for layered repos: $base_cfg"
+
+  tmp="$(mktemp)"
+  out="$(mktemp)"
+  rpm_mock_config_extract_dnf_file "$base_cfg" "$target" "$arch" >"$tmp"
+  : >"$out"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      __REPOSITORY_BUILDER_DNF_OP_set__)
+        : >"$out"
+        ;;
+      __REPOSITORY_BUILDER_DNF_OP_append__)
+        ;;
+      *)
+        printf '%s\n' "$line" >>"$out"
+        ;;
+    esac
+  done <"$tmp"
+
+  cat "$out"
+  rm -f "$tmp" "$out"
+}
+
+rpm_dnf_remove_repo_sections(){
+  local input="$1" output="$2"
+  shift 2
+  local ids="|" id
+
+  for id in "$@"; do
+    [[ -n "$id" ]] || continue
+    ids+="$id|"
+  done
+
+  awk -v ids="$ids" '
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      repo = $0
+      sub(/^[[:space:]]*\[/, "", repo)
+      sub(/\][[:space:]]*$/, "", repo)
+      skip = (index(ids, "|" repo "|") > 0)
+    }
+    !skip { print }
+  ' "$input" >"$output"
+}
+
+rpm_dnf_merge_repo_section(){
+  local base="$1" fragment="$2" repo_id="$3" output="$4"
+
+  awk -v repo_id="$repo_id" '
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    function parse_line(line, values, seen, order, counter_name, key, value, count) {
+      if (line !~ /^[[:space:]]*[^#;][^=]*=/) return
+      key = line
+      sub(/=.*/, "", key)
+      key = trim(key)
+      value = line
+      sub(/^[^=]*=/, "", value)
+      value = trim(value)
+      if (key == "") return
+      if (!(key in seen)) {
+        count = counters[counter_name] + 1
+        counters[counter_name] = count
+        order[count] = key
+        seen[key] = 1
+      }
+      values[key] = value
+    }
+    FNR == 1 { file_index++ }
+    file_index == 1 {
+      if ($0 ~ /^[[:space:]]*\[[^]]+\][[:space:]]*$/) {
+        current = $0
+        sub(/^[[:space:]]*\[/, "", current)
+        sub(/\][[:space:]]*$/, "", current)
+        in_existing = (current == repo_id)
+        next
+      }
+      if (in_existing) parse_line($0, existing_values, existing_seen, existing_order, "existing")
+      next
+    }
+    file_index == 2 {
+      if ($0 ~ /^[[:space:]]*\[[^]]+\][[:space:]]*$/) {
+        current = $0
+        sub(/^[[:space:]]*\[/, "", current)
+        sub(/\][[:space:]]*$/, "", current)
+        frag_sections++
+        frag_order[frag_sections] = current
+        in_fragment = frag_sections
+        if (current == repo_id) selected_fragment = current
+        next
+      }
+      if (in_fragment) frag_text[in_fragment] = frag_text[in_fragment] $0 "\n"
+      next
+    }
+    END {
+      if (selected_fragment == "" && frag_sections == 1) selected_fragment = frag_order[1]
+      if (selected_fragment == "") selected_fragment = repo_id
+
+      for (i = 1; i <= frag_sections; i++) {
+        if (frag_order[i] == selected_fragment) selected_text = frag_text[i]
+      }
+      line_count = split(selected_text, lines, "\n")
+      for (i = 1; i <= line_count; i++) parse_line(lines[i], replacement_values, replacement_seen, replacement_order, "replacement")
+
+      print "[" repo_id "]"
+      for (i = 1; i <= counters["existing"]; i++) {
+        key = existing_order[i]
+        if (key in replacement_seen) {
+          if (replacement_values[key] != "") print key "=" replacement_values[key]
+        } else {
+          print key "=" existing_values[key]
+        }
+      }
+      for (i = 1; i <= counters["replacement"]; i++) {
+        key = replacement_order[i]
+        if (!(key in existing_seen) && replacement_values[key] != "") print key "=" replacement_values[key]
+      }
+    }
+  ' "$base" "$fragment" >"$output"
+}
+
+rpm_write_mock_config_text_assignment(){
+  local cfg_file="$1" text_file="$2"
 
   {
-    printf "\nconfig_opts['dnf.conf'] += r'''\n"
-    printf '\n# layered repo fragment: %s\n' "$title"
-    cat "$fragment"
-    printf '\n'
-    printf "'''\n"
+    printf "config_opts['dnf.conf'] = r'''\n"
+    cat "$text_file"
+    printf "\n'''\n"
   } >>"$cfg_file"
 }
 
 rpm_effective_mock_target(){
   local target="$1" family arch root="${RPM_LAYER_ROOT:-}"
   local repo_files=() cfg_file safe_source safe_target derived_target file
-  local release tmp_dir expanded mode replace_id rel first
-  local replace_ids=()
+  local release tmp_dir expanded mode replace_id rel current next section merged
 
   [[ -n "$root" && -d "$root" ]] || { printf '%s\n' "$target"; return 0; }
 
@@ -425,118 +617,8 @@ rpm_effective_mock_target(){
   rm -rf "$tmp_dir"
   mkdir -p /etc/mock "$tmp_dir"
 
-  {
-    printf "include('/etc/mock/%s.cfg')\n" "$target"
-    cat <<'PYCODE'
-
-import re
-
-def _repository_builder_remove_repo_section(conf, repo_id):
-    pattern = r'(?ms)^\[' + re.escape(repo_id) + r'\]\n.*?(?=^\[|\Z)'
-    return re.sub(pattern, '', conf).strip() + '\n'
-
-def _repository_builder_fragment_sections(fragment):
-    sections = []
-    current_id = None
-    current_lines = []
-
-    for line in fragment.splitlines():
-        match = re.match(r'^\s*\[([^]]+)\]\s*$', line)
-        if match:
-            if current_id is not None:
-                sections.append((current_id, current_lines))
-            current_id = match.group(1).strip()
-            current_lines = []
-        elif current_id is not None:
-            current_lines.append(line)
-
-    if current_id is not None:
-        sections.append((current_id, current_lines))
-
-    return sections
-
-def _repository_builder_parse_repo_key_values(lines):
-    order = []
-    values = {}
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#') or stripped.startswith(';'):
-            continue
-
-        match = re.match(r'^\s*([^=:#][^=]*?)\s*=\s*(.*?)\s*$', line)
-        if not match:
-            continue
-
-        key = match.group(1).strip()
-        value = match.group(2)
-        if key not in values:
-            order.append(key)
-        values[key] = value
-
-    return order, values
-
-def _repository_builder_render_repo_section(repo_id, order, values):
-    rendered = ['[' + repo_id + ']']
-    for key in order:
-        if key in values:
-            rendered.append(key + '=' + values[key])
-    return '\n'.join(rendered).rstrip() + '\n'
-
-def _repository_builder_merge_repo_section(conf, repo_id, replacement_lines):
-    pattern = r'(?ms)^\[' + re.escape(repo_id) + r'\]\n.*?(?=^\[|\Z)'
-    match = re.search(pattern, conf)
-
-    if match:
-        existing_section = match.group(0).splitlines()[1:]
-        order, values = _repository_builder_parse_repo_key_values(existing_section)
-    else:
-        order, values = [], {}
-
-    replacement_order, replacement_values = _repository_builder_parse_repo_key_values(replacement_lines)
-
-    for key in replacement_order:
-        value = replacement_values[key]
-        # Empty values in a replacement fragment mean "remove this inherited key".
-        # This is useful for switching from mirrorlist/metalink to baseurl while
-        # preserving unrelated defaults such as gpgkey.
-        if value == '':
-            values.pop(key, None)
-            order = [item for item in order if item != key]
-            continue
-
-        if key not in values:
-            order.append(key)
-        values[key] = value
-
-    rendered = _repository_builder_render_repo_section(repo_id, order, values)
-
-    if match:
-        return (conf[:match.start()] + rendered + conf[match.end():]).strip() + '\n'
-
-    return conf.rstrip() + '\n\n' + rendered
-
-def _repository_builder_merge_repo_fragment(conf, fragment, replace_ids):
-    sections = _repository_builder_fragment_sections(fragment)
-    if not sections:
-        return conf
-
-    if not replace_ids:
-        replace_ids = [section_id for section_id, _lines in sections]
-
-    if len(sections) == 1:
-        _section_id, lines = sections[0]
-        for repo_id in replace_ids:
-            conf = _repository_builder_merge_repo_section(conf, repo_id, lines)
-        return conf
-
-    for index, (section_id, lines) in enumerate(sections):
-        repo_id = replace_ids[index] if index < len(replace_ids) else section_id
-        conf = _repository_builder_merge_repo_section(conf, repo_id, lines)
-
-    return conf
-PYCODE
-  } >"$cfg_file"
+  current="$tmp_dir/dnf.conf.current"
+  rpm_mock_base_dnf_conf "$target" "$arch" >"$current"
 
   for file in "${repo_files[@]}"; do
     rel="${file#$root/}"
@@ -544,45 +626,64 @@ PYCODE
     rpm_expand_repo_fragment "$file" "$expanded" "$target" "$family" "$arch" "$release"
     mode="$(rpm_repo_fragment_mode "$expanded")"
 
-    {
-      printf '\n# repository-builder repo fragment metadata\n'
-      printf '# source: %s\n' "$rel"
-      printf '# mode: %s\n' "$mode"
-    } >>"$cfg_file"
-
     case "$mode" in
+      add)
+        next="$tmp_dir/dnf.conf.next"
+        {
+          cat "$current"
+          printf '\n# layered repo fragment: %s\n' "$rel"
+          cat "$expanded"
+          printf '\n'
+        } >"$next"
+        mv "$next" "$current"
+        ;;
       replace)
-        mapfile -t replace_ids < <(rpm_repo_fragment_replace_ids "$expanded")
-        for replace_id in "${replace_ids[@]}"; do
-          [[ -n "$replace_id" ]] || continue
-          printf '# merges-replaces: %s\n' "$replace_id" >>"$cfg_file"
-        done
-
-        printf "config_opts['dnf.conf'] = _repository_builder_merge_repo_fragment(config_opts['dnf.conf'], r'''\n" >>"$cfg_file"
-        cat "$expanded" >>"$cfg_file"
-        printf "\n''', [" >>"$cfg_file"
-        first=1
-        for replace_id in "${replace_ids[@]}"; do
-          [[ -n "$replace_id" ]] || continue
-          if ((first)); then first=0; else printf ', ' >>"$cfg_file"; fi
-          rpm_python_single_quote "$replace_id" >>"$cfg_file"
-        done
-        printf "])\n" >>"$cfg_file"
-        ;;&
-      replace-section)
         while IFS= read -r replace_id; do
           [[ -n "$replace_id" ]] || continue
-          printf "config_opts['dnf.conf'] = _repository_builder_remove_repo_section(config_opts['dnf.conf'], " >>"$cfg_file"
-          rpm_python_single_quote "$replace_id" >>"$cfg_file"
-          printf ")\n" >>"$cfg_file"
-          printf '# replaces-section: %s\n' "$replace_id" >>"$cfg_file"
+          section="$tmp_dir/repo-section-${replace_id//[^A-Za-z0-9_.-]/_}.repo"
+          merged="$tmp_dir/dnf.conf.merged"
+          next="$tmp_dir/dnf.conf.next"
+          rpm_dnf_merge_repo_section "$current" "$expanded" "$replace_id" "$section"
+          rpm_dnf_remove_repo_sections "$current" "$merged" "$replace_id"
+          {
+            cat "$merged"
+            printf '\n# layered repo fragment: %s\n' "$rel"
+            printf '# mode: replace\n'
+            printf '# merged-replaces: %s\n' "$replace_id"
+            cat "$section"
+            printf '\n'
+          } >"$next"
+          mv "$next" "$current"
         done < <(rpm_repo_fragment_replace_ids "$expanded")
-        ;;&
-      add|replace-section)
-        rpm_write_repo_fragment_append "$cfg_file" "$rel" "$expanded"
+        ;;
+      replace-section)
+        next="$tmp_dir/dnf.conf.next"
+        cp "$current" "$tmp_dir/dnf.conf.without"
+        while IFS= read -r replace_id; do
+          [[ -n "$replace_id" ]] || continue
+          rpm_dnf_remove_repo_sections "$tmp_dir/dnf.conf.without" "$tmp_dir/dnf.conf.without.next" "$replace_id"
+          mv "$tmp_dir/dnf.conf.without.next" "$tmp_dir/dnf.conf.without"
+        done < <(rpm_repo_fragment_replace_ids "$expanded")
+        {
+          cat "$tmp_dir/dnf.conf.without"
+          printf '\n# layered repo fragment: %s\n' "$rel"
+          printf '# mode: replace-section\n'
+          cat "$expanded"
+          printf '\n'
+        } >"$next"
+        mv "$next" "$current"
+        ;;
+      *)
+        die "Unsupported builder-mode '$mode' in repo fragment: $file"
         ;;
     esac
   done
+
+  {
+    printf "include('/etc/mock/%s.cfg')\n" "$target"
+    printf '\n# repository-builder merged dnf.conf generated in bash from layered repos\n'
+  } >"$cfg_file"
+  rpm_write_mock_config_text_assignment "$cfg_file" "$current"
 
   printf '%s\n' "$derived_target"
 }
