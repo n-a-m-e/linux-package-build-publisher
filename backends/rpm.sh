@@ -1484,12 +1484,13 @@ rpm_source_download_filename(){
 rpm_download_expanded_sources_host(){
   local spec_dir="$1" source_list="$2"
   local cache_dir="/package-cache/source-downloads"
-  local source download_url filename url_hash cache_file tmp dest
+  local source download_url filename url_hash cache_file tmp dest mode
 
   [[ -d "$spec_dir" ]] || die "Missing RPM source directory: $spec_dir"
   [[ -f "$source_list" ]] || die "Missing expanded RPM source list: $source_list"
   command -v curl >/dev/null 2>&1 || die "curl is not installed in the host builder container"
   mkdir -p "$cache_dir"
+  mode="$(rpm_cache_mode)"
 
   while IFS= read -r source; do
     source="${source%$'\r'}"
@@ -1503,10 +1504,14 @@ rpm_download_expanded_sources_host(){
         tmp="$cache_file.tmp.$$"
         dest="$spec_dir/$filename"
 
-        if [[ -s "$cache_file" ]]; then
+        if [[ "$mode" != off && -s "$cache_file" ]]; then
           echo "Using cached source: $source -> $filename" >&2
         else
-          echo "Downloading source: $download_url -> $filename" >&2
+          if [[ "$mode" == off ]]; then
+            echo "Downloading source without cache read: $download_url -> $filename" >&2
+          else
+            echo "Downloading source: $download_url -> $filename" >&2
+          fi
           rm -f "$tmp"
           if ! curl -fL --retry 3 --retry-delay 2 -o "$tmp" "$download_url"; then
             rm -f "$tmp"
@@ -1643,6 +1648,20 @@ rpm_cache_has_binary_rpms(){
     -print -quit | grep -q .
 }
 
+
+rpm_target_config_fingerprint(){
+  local package_type="$1"
+  local family="$2"
+  local arch="$3"
+  local config_file
+
+  config_file="$(find_target_config "$package_type" "$family" "$arch")"
+  {
+    printf 'target_config_path=%s\n' "${config_file#$ROOT/}"
+    printf 'target_config_sha256=%s\n' "$(sha256_file "$config_file")"
+  } | sha256_lines
+}
+
 rpm_queue_quick_fingerprint(){
   local target="$1"
   local family="$2"
@@ -1651,12 +1670,13 @@ rpm_queue_quick_fingerprint(){
   local spec="$5"
   local source_id="$6"
   local subdir="$7"
-  local base layered file
+  local base layered file target_config_fp
 
   base="${spec%.spec}"
+  target_config_fp="$(rpm_target_config_fingerprint rpm "$family" "$arch")"
 
   {
-    printf '%s\n' "rpm-queue-quick-fingerprint-v1" "$source_id" "$subdir" "$spec" "$target" "$arch"
+    printf '%s\n' "rpm-queue-quick-fingerprint-v2" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp"
 
     if layered="$(layered_best_file "$root" "$family" "$target" specs "$spec")"; then
       [[ -n "$layered" ]] && sha256_file "$layered"
@@ -1693,12 +1713,13 @@ rpm_queue_srpm_fingerprint(){
   local source_id="$6"
   local subdir="$7"
   local srpm="$8"
-  local file
+  local file target_config_fp
 
   [[ -f "$srpm" ]] || die "Missing SRPM for cache fingerprint: $srpm"
+  target_config_fp="$(rpm_target_config_fingerprint rpm "$family" "$arch")"
 
   {
-    printf '%s\n' "rpm-queue-srpm-fingerprint-v1" "$source_id" "$subdir" "$spec" "$target" "$arch"
+    printf '%s\n' "rpm-queue-srpm-fingerprint-v2" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp"
     sha256_file "$srpm"
 
     while IFS= read -r file; do
