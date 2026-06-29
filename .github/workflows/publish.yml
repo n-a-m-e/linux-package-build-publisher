@@ -81,7 +81,6 @@ jobs:
           REBUILD_TRIGGER: ${{ inputs.rebuild-trigger }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           TARGETS: ${{ inputs.targets }}
-          CACHE_MODE: ${{ inputs.cache-mode }}
           GPG_CACHE_HIT: ${{ steps.gpg-cache.outputs.cache-hit }}
         run: bash publisher/repository_builder.sh prepare
   build:
