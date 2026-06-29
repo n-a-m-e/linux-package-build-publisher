@@ -2,6 +2,12 @@
 
 # RPM backend: mock, rpmbuild/rpmspec, createrepo, signing, graphing, publishing, and RPM-specific diagnostics.
 
+# Normal RPM builds should keep the GitHub log summary-first. Detailed
+# mock/repository diagnostics are still written under each package result
+# directory, but they are only printed inline when a command fails.
+declare -Ag RPM_REPO_DEBUG_SEEN=()
+RPM_LDCONFIG_EXPLANATION_PRINTED=0
+
 rpm_configure_signing(){
   cat >/root/.rpmmacros <<EOF
 %_signature gpg
@@ -34,7 +40,7 @@ rpm_dump_mock_failure(){
 }
 
 rpm_diagnostic_write_srpm_host(){
-  local result="$1" srpm="$2" log
+  local result="$1" srpm="$2" log count
 
   [[ -n "$srpm" && -f "$srpm" ]] || return 0
 
@@ -52,8 +58,8 @@ rpm_diagnostic_write_srpm_host(){
     echo
   } >"$log"
 
-  echo "--- ${log#$result/} ---" >&2
-  cat "$log" >&2 || true
+  count="$(rpm -qpR "$srpm" 2>/dev/null | awk 'NF && $0 !~ /^rpmlib\(/ { count++ } END { print count + 0 }')"
+  echo "SRPM metadata captured: ${log#$result/} ($count BuildRequires entries)" >&2
 }
 
 rpm_diagnostic_mock_log_files(){
@@ -692,7 +698,7 @@ rpm_mock_args_array(){
   local target="$1" phase="$2" family arch
   local -n out_args="$3"
 
-  out_args=()
+  out_args=(--quiet)
   IFS=$'	' read -r family arch < <(split_target "$target")
   load_target rpm "$family" "$arch"
 
@@ -702,7 +708,9 @@ rpm_mock_args_array(){
   esac
 
   if [[ -n "${TARGET_RPM_MOCK_CONFIG_OPTS:-}" ]]; then
-    read -r -a out_args <<<"$TARGET_RPM_MOCK_CONFIG_OPTS"
+    local configured_args=()
+    read -r -a configured_args <<<"$TARGET_RPM_MOCK_CONFIG_OPTS"
+    out_args+=("${configured_args[@]}")
   fi
 
   if [[ -n "${TARGET_RPM_CHROOT_SETUP_CMD:-}" ]]; then
@@ -725,6 +733,7 @@ rpm_mock_with_args(){
     return 0
   fi
 
+  rpm_mock_repo_failure_debug "$result" "$target" "$effective_target" "failure-${phase}-mock-command" "${mock_args[@]}"
   rpm_dump_mock_failure "$result" "$msg"
   die "$msg"
 }
@@ -762,6 +771,7 @@ rpm_mock_out_with_binds(){
 
   printf '%s
 ' "$out" >&2
+  rpm_mock_repo_failure_debug "$result" "$target" "$effective_target" "failure-${phase}-mock-bind-command" "${mock_args[@]}"
   rpm_dump_mock_failure "$result" "$msg"
   die "$msg"
 }
@@ -847,9 +857,14 @@ rpm_finalize_stepwise_buildroot(){
   {
     echo
     echo "=== finalise buildroot after BuildRequires installs ==="
-    echo "reason=BuildRequires were installed with scriptlets/triggers suppressed; refresh generic runtime linker state before rebuild"
     echo "command=$finalize_cmd"
-  } | tee -a "$log" >&2
+  } >>"$log"
+
+  if [[ "${RPM_LDCONFIG_EXPLANATION_PRINTED:-0}" != 1 ]]; then
+    echo "BuildRequires are installed with scriptlets/triggers suppressed; refreshing the linker cache before rebuilds." >&2
+    RPM_LDCONFIG_EXPLANATION_PRINTED=1
+  fi
+  echo "Refreshing linker cache for $target" >&2
 
   if mock -r "$target" "${mock_args[@]}" --chroot "$finalize_cmd" >>"$log" 2>&1; then
     {
@@ -865,7 +880,6 @@ rpm_finalize_stepwise_buildroot(){
     echo "warning: buildroot finalisation command exited with status $status; continuing to rebuild" >&2
   fi
 }
-
 
 rpm_safe_filename(){
   local value="$1"
@@ -1007,7 +1021,7 @@ rpm_mock_config_debug_dump(){
 
   [[ -n "$cfg" ]] || return 0
   [[ "$depth" -le 4 ]] || {
-    echo "config_include_depth_limit_reached=$cfg" | tee -a "$log" >&2
+    echo "config_include_depth_limit_reached=$cfg" >>"$log"
     return 0
   }
 
@@ -1015,7 +1029,7 @@ rpm_mock_config_debug_dump(){
     {
       echo
       echo "--- missing mock config: $cfg ---"
-    } | tee -a "$log" >&2
+    } >>"$log"
     return 0
   fi
 
@@ -1023,7 +1037,7 @@ rpm_mock_config_debug_dump(){
     echo
     echo "--- mock config: $cfg ---"
     cat "$cfg"
-  } | tee -a "$log" >&2
+  } >>"$log"
 
   dir="$(dirname "$cfg")"
   while IFS= read -r include; do
@@ -1036,12 +1050,21 @@ rpm_mock_config_debug_dump(){
     fi
     rpm_mock_config_debug_dump "$log" "$inc_path" $((depth + 1))
   done < <(
-    sed -nE "s/^[[:space:]]*include\(['\"]([^'\"]+)['\"]\).*/\1/p" "$cfg" | awk 'NF && !seen[$0]++'
+    awk '
+      /^[[:space:]]*include\(/ {
+        line = $0
+        sub(/^[[:space:]]*include\(/, "", line)
+        sub(/\).*/, "", line)
+        gsub(/\047/, "", line)
+        gsub(/"/, "", line)
+        if (line != "" && !seen[line]++) print line
+      }
+    ' "$cfg"
   )
 }
 
 rpm_debug_dump_file(){
-  local log="$1" title="$2" file="$3"
+  local log="$1" title="$2" file="$3" inline="${4:-0}"
   {
     echo
     echo "=== $title ==="
@@ -1050,14 +1073,54 @@ rpm_debug_dump_file(){
     else
       echo "missing_file=$file"
     fi
-  } | tee -a "$log" >&2
+  } >>"$log"
+
+  if [[ "$inline" == 1 ]]; then
+    {
+      echo
+      echo "=== $title ==="
+      if [[ -f "$file" ]]; then
+        cat "$file"
+      else
+        echo "missing_file=$file"
+      fi
+    } >&2
+  fi
+}
+
+rpm_mock_repo_fragment_debug(){
+  local log="$1" root="$2" family="$3" target="$4" rel file
+
+  if [[ -n "$root" && -d "$root" ]]; then
+    {
+      echo
+      echo "=== layered repo fragments visible to this source ==="
+    } >>"$log"
+    while IFS= read -r file; do
+      [[ -n "$file" ]] || continue
+      rel="${file#$root/}"
+      {
+        echo
+        echo "--- layered repo fragment: $rel ---"
+        cat "$file"
+      } >>"$log"
+    done < <(rpm_layered_repo_files "$root" "$family" "$target")
+  else
+    echo "layered_repo_fragments=not_checked_no_RPM_LAYER_ROOT" >>"$log"
+  fi
 }
 
 rpm_mock_repo_debug(){
   local result="$1" target="$2" effective_target="$3" label="$4"
   shift 4
 
-  local mock_args=("$@") diag_dir log root family arch rel file status cfg
+  local mock_args=("$@") diag_dir log root family arch status cfg key hash
+
+  key="$effective_target"
+  if [[ -n "${RPM_REPO_DEBUG_SEEN[$key]:-}" ]]; then
+    return 0
+  fi
+  RPM_REPO_DEBUG_SEEN[$key]=1
 
   mkdir -p "$result"
   diag_dir="$result/mock-repo-debug"
@@ -1065,154 +1128,116 @@ rpm_mock_repo_debug(){
   log="$diag_dir/$label.log"
   : >"$log"
 
+  cfg="/etc/mock/$effective_target.cfg"
+  hash="missing"
+  [[ -f "$cfg" ]] && hash="$(sha256_file "$cfg")"
+
   {
     echo "=== mock repository debug ==="
     echo "label=$label"
     echo "target=$target"
     echo "effective_target=$effective_target"
     echo "mock_args=${mock_args[*]}"
+    echo "mock_config=$cfg"
+    echo "mock_config_sha256=$hash"
     echo "debug_dir=${diag_dir#$result/}"
     echo
     echo "=== generated and included mock config tree ==="
-  } | tee -a "$log" >&2
+  } >>"$log"
 
-  rpm_mock_config_debug_dump "$log" "/etc/mock/$effective_target.cfg" 0
+  rpm_mock_config_debug_dump "$log" "$cfg" 0
 
   root="${RPM_LAYER_ROOT:-}"
-  if [[ -n "$root" && -d "$root" ]]; then
-    {
-      echo
-      echo "=== layered repo fragments visible to this source ==="
-    } | tee -a "$log" >&2
-    IFS=$'\t' read -r family arch < <(split_target "$target") || true
-    if [[ -n "${family:-}" ]]; then
-      while IFS= read -r file; do
-        [[ -n "$file" ]] || continue
-        rel="${file#$root/}"
-        {
-          echo
-          echo "--- layered repo fragment: $rel ---"
-          cat "$file"
-        } | tee -a "$log" >&2
-      done < <(rpm_layered_repo_files "$root" "$family" "$target")
-    fi
-  else
-    echo "layered_repo_fragments=not_checked_no_RPM_LAYER_ROOT" | tee -a "$log" >&2
+  IFS=$'\t' read -r family arch < <(split_target "$target") || true
+  if [[ -n "${family:-}" ]]; then
+    rpm_mock_repo_fragment_debug "$log" "$root" "$family" "$target"
   fi
-
-  {
-    echo
-    echo "=== mock --pm-cmd repolist --all ==="
-  } | tee -a "$log" >&2
-  if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist --all >>"$log" 2>&1; then
-    echo "repolist_all_status=0" >>"$log"
-  else
-    status=$?
-    echo "repolist_all_status=$status" >>"$log"
-    echo "note=repolist may fail before the chroot/package-manager environment exists; continuing" >>"$log"
-  fi
-  tail -n +1 "$log" >/dev/null
-  {
-    echo
-    echo "--- repolist --all output above was written to ${log#$result/} ---"
-  } >&2
 
   {
     echo
     echo "=== mock --pm-cmd repolist --enabled ==="
-  } | tee -a "$log" >&2
+  } >>"$log"
   if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist --enabled >>"$log" 2>&1; then
     echo "repolist_enabled_status=0" >>"$log"
   else
     status=$?
     echo "repolist_enabled_status=$status" >>"$log"
-    echo "note=enabled repolist may not be supported by the active package manager; continuing" >>"$log"
-  fi
-
-  {
-    echo
-    echo "=== mock --pm-cmd repolist -v ==="
-  } | tee -a "$log" >&2
-  if mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist -v >>"$log" 2>&1; then
-    echo "repolist_verbose_status=0" >>"$log"
-  else
-    status=$?
-    echo "repolist_verbose_status=$status" >>"$log"
-    echo "note=verbose repolist may not be supported by the active package manager; continuing" >>"$log"
+    echo "note=enabled repolist may not be supported before the package-manager environment exists" >>"$log"
   fi
 
   {
     echo
     echo "=== mock repo debug complete ==="
     echo "mock_repo_debug_log=${log#$result/}"
-  } | tee -a "$log" >&2
+  } >>"$log"
 
-  # Print the complete file into the job log. This is intentionally verbose:
-  # it makes CI logs self-contained, so callers do not have to download the
-  # artifact to see which repos, URLs, priorities and config fragments were used.
-  echo "--- begin ${log#$result/} ---" >&2
-  cat "$log" >&2 || true
-  echo "--- end ${log#$result/} ---" >&2
+  echo "Mock repo diagnostics captured for $effective_target: ${log#$result/} (config sha256: $hash)" >&2
 }
-rpm_buildrequires_provider_debug(){
-  local result="$1" effective_target="$2" log="$3" deps_file="$4" label="$5"
-  shift 5
 
-  local mock_args=("$@") diag_dir dep safe status out_file qf_file
+rpm_mock_repo_failure_debug(){
+  local result="$1" target="$2" effective_target="$3" label="$4"
+  shift 4
 
-  [[ -f "$deps_file" ]] || return 0
-  diag_dir="$result/mock-repo-debug/buildrequires-providers-$label"
+  local mock_args=("$@") diag_dir log root family arch status cfg hash
+
+  mkdir -p "$result"
+  diag_dir="$result/mock-repo-debug"
   mkdir -p "$diag_dir"
+  log="$diag_dir/$label.log"
+  : >"$log"
+
+  cfg="/etc/mock/$effective_target.cfg"
+  hash="missing"
+  [[ -f "$cfg" ]] && hash="$(sha256_file "$cfg")"
 
   {
-    echo
-    echo "=== BuildRequires provider repository debug ==="
+    echo "=== mock repository failure debug ==="
     echo "label=$label"
+    echo "target=$target"
     echo "effective_target=$effective_target"
-    echo "diagnostics_dir=${diag_dir#$result/}"
-    echo "format=name<TAB>evr<TAB>arch<TAB>repoid<TAB>location"
-  } | tee -a "$log" >&2
+    echo "mock_args=${mock_args[*]}"
+    echo "mock_config=$cfg"
+    echo "mock_config_sha256=$hash"
+    echo "debug_dir=${diag_dir#$result/}"
+    echo
+    echo "=== generated and included mock config tree ==="
+  } >>"$log"
 
-  while IFS= read -r dep; do
-    [[ -n "$dep" ]] || continue
-    safe="$(rpm_safe_filename "$dep")"
-    out_file="$diag_dir/whatprovides-$safe.txt"
-    qf_file="$diag_dir/whatprovides-qf-$safe.txt"
+  rpm_mock_config_debug_dump "$log" "$cfg" 0
 
-    {
-      echo
-      echo "--- dependency: $dep ---"
-      echo "whatprovides_file=${out_file#$result/}"
-      echo "whatprovides_qf_file=${qf_file#$result/}"
-    } | tee -a "$log" >&2
-
-    if mock -r "$effective_target" "${mock_args[@]}" \
-      --pm-cmd repoquery --whatprovides --showduplicates --location "$dep" \
-      >"$out_file" 2>&1; then
-      status=0
-    else
-      status=$?
-    fi
-    echo "whatprovides_status=$status" | tee -a "$log" >&2
-    rpm_debug_dump_file "$log" "repoquery --whatprovides --showduplicates --location $dep" "$out_file"
-
-    if mock -r "$effective_target" "${mock_args[@]}" \
-      --pm-cmd repoquery --whatprovides --showduplicates --qf '%{name}\t%{evr}\t%{arch}\t%{repoid}\t%{location}' "$dep" \
-      >"$qf_file" 2>&1; then
-      status=0
-    else
-      status=$?
-    fi
-    echo "whatprovides_qf_status=$status" | tee -a "$log" >&2
-    rpm_debug_dump_file "$log" "repoquery --whatprovides --showduplicates --qf for $dep" "$qf_file"
-  done <"$deps_file"
+  root="${RPM_LAYER_ROOT:-}"
+  IFS=$'\t' read -r family arch < <(split_target "$target") || true
+  if [[ -n "${family:-}" ]]; then
+    rpm_mock_repo_fragment_debug "$log" "$root" "$family" "$target"
+  fi
 
   {
     echo
-    echo "=== provider debug files ==="
-    find "$diag_dir" -maxdepth 1 -type f -printf '  - %f\n' | sort
-  } | tee -a "$log" >&2
+    echo "=== mock --pm-cmd repolist --enabled ==="
+  } >>"$log"
+  mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist --enabled >>"$log" 2>&1 || { status=$?; echo "repolist_enabled_status=$status" >>"$log"; }
+
+  {
+    echo
+    echo "=== mock --pm-cmd repolist --all ==="
+  } >>"$log"
+  mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist --all >>"$log" 2>&1 || { status=$?; echo "repolist_all_status=$status" >>"$log"; }
+
+  {
+    echo
+    echo "=== mock --pm-cmd repolist -v ==="
+  } >>"$log"
+  mock -r "$effective_target" "${mock_args[@]}" --pm-cmd repolist -v >>"$log" 2>&1 || { status=$?; echo "repolist_verbose_status=$status" >>"$log"; }
+
+  {
+    echo
+    echo "=== mock repo failure debug complete ==="
+    echo "mock_repo_failure_debug_log=${log#$result/}"
+  } >>"$log"
+
+  echo "Mock failure diagnostics captured: ${log#$result/}" >&2
 }
+
 rpm_install_buildrequires_stepwise(){
   local result="$1" msg="$2" target="$3" phase="$4" srpm="$5"
   shift 5
@@ -1260,7 +1285,6 @@ rpm_install_buildrequires_stepwise(){
   } >"$log"
 
   rpm_mock_repo_debug "$result" "$target" "$effective_target" "before-stepwise-buildrequires" "${mock_args[@]}"
-  rpm_buildrequires_provider_debug "$result" "$effective_target" "$log" "$deps_file" "before-stepwise-buildrequires" "${mock_args[@]}"
 
   if [[ "$total" -eq 0 ]]; then
     {
@@ -1319,9 +1343,10 @@ rpm_install_buildrequires_stepwise(){
         rpm_dnf_dependency_diagnostics "$result" "$effective_target" "$log" "$dep" "allowerasing-retry-failed" "${mock_args[@]}"
 
         rpm_stepwise_buildrequires_failure_report "$result" "$log"
+        rpm_mock_repo_failure_debug "$result" "$target" "$effective_target" "failure-stepwise-buildrequires" "${mock_args[@]}"
         rpm_dump_mock_failure "$result" "$msg"
-        echo "--- ${log#$result/} ---" >&2
-        cat "$log" >&2 || true
+        echo "--- ${log#$result/} (last ${MOCK_LOG_TAIL_LINES:-200} lines) ---" >&2
+        tail -n "${MOCK_LOG_TAIL_LINES:-200}" "$log" >&2 || true
         die "$msg; failed while installing BuildRequires entry: $dep"
       fi
     fi
@@ -1551,6 +1576,24 @@ rpm_fetch_sources_in_mock(){
   rm -f "$list_path"
 }
 
+rpm_update_local_repo(){
+  local dir="$1" log count
+
+  mkdir -p "$dir"
+  log="$(mktemp /tmp/repository-builder-createrepo.XXXXXX.log)"
+  count="$(find "$dir" -maxdepth 1 -type f -name '*.rpm' | wc -l | awk '{print $1}')"
+
+  if createrepo_c --update "$dir" >"$log" 2>&1; then
+    rm -f "$log"
+    echo "Updated local repo: $count packages" >&2
+  else
+    echo "createrepo_c failed for $dir" >&2
+    tail -n "${MOCK_LOG_TAIL_LINES:-200}" "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  fi
+}
+
 rpm_copy_one(){
   local file="$1" repo="$2" source_repo="$3" local_repo="$4"
   local dest_name
@@ -1581,7 +1624,35 @@ rpm_copy_artifacts(){
     done
   fi
 
-  createrepo_c --update "$local_repo"
+  rpm_update_local_repo "$local_repo"
+}
+
+rpm_source_subdir_fingerprint(){
+  local root="$1"
+  local subdir="$2"
+  local dir file rel
+
+  [[ -n "$subdir" ]] || subdir="."
+
+  if [[ "$subdir" == "." ]]; then
+    dir="$root"
+  else
+    dir="$root/$subdir"
+  fi
+
+  [[ -d "$dir" ]] || die "Missing source subdir for fingerprint: $subdir"
+
+  {
+    printf 'subdir %s\n' "$subdir"
+    find "$dir" -type d -name .git -prune -o -type f -print | sort | while IFS= read -r file; do
+      rel="${file#$root/}"
+      if [[ "$rel" == "$file" ]]; then
+        rel="${file#$root}"
+        rel="${rel#/}"
+      fi
+      printf '%s  %s\n' "$(sha256_file "$file")" "$rel"
+    done
+  } | sha256_lines
 }
 
 rpm_queue_fingerprint(){
@@ -1597,7 +1668,7 @@ rpm_queue_fingerprint(){
   base="${spec%.spec}"
 
   {
-    printf '%s\n' "$source_id" "$(source_tree_fingerprint "$root")" "$subdir" "$spec" "$target" "$arch"
+    printf '%s\n' "rpm-queue-fingerprint-v2" "$source_id" "$(rpm_source_subdir_fingerprint "$root" "$subdir")" "$subdir" "$spec" "$target" "$arch"
 
     if layered="$(layered_best_file "$root" "$family" "$target" specs "$spec")"; then
       [[ -n "$layered" ]] && sha256_file "$layered"
@@ -1627,7 +1698,7 @@ rpm_queue_fingerprint(){
 
 rpm_build_queued(){
   local qfile="$1" target="$2" family="$3" arch="$4" repo_path="$5"
-  local build_id cache work srpm_dir result repo src_repo local_repo root fp spec_path spec_dir url srpm
+  local build_id cache work srpm_dir result repo src_repo local_repo root fp cache_fp spec_path spec_dir url srpm
   load_queue "$qfile"
   build_id="${SUBDIR//\//_}"
   cache="/package-cache/rpm/$PRIMARY_APP/$target/$build_id"
@@ -1640,12 +1711,24 @@ rpm_build_queued(){
   root="/work/work/${SOURCE_ID:-$PRIMARY_APP}"
 
   mkdir -p "$cache" "$result" "$repo" "$src_repo" "$local_repo"
-  createrepo_c "$local_repo"
+  rpm_update_local_repo "$local_repo"
   fp="$(rpm_queue_fingerprint "$target" "$family" "$arch" "$root" "$SPEC" "${SOURCE_ID:-$PRIMARY_APP}" "$SUBDIR")"
-  if [[ -f "$cache/.fingerprint" && "$(cat "$cache/.fingerprint")" == "$fp" ]] && compgen -G "$cache/*.rpm" >/dev/null;
-  then
+  cache_fp=""
+  [[ -f "$cache/.fingerprint" ]] && cache_fp="$(cat "$cache/.fingerprint")"
+
+  if [[ "$cache_fp" == "$fp" ]] && compgen -G "$cache/*.rpm" >/dev/null; then
+    echo "Using cached RPM artifacts for $target/$build_id" >&2
     rpm_copy_artifacts "$cache" "$repo" "$src_repo" "$local_repo"
     return 0
+  fi
+
+
+  if [[ -z "$cache_fp" ]]; then
+    echo "RPM cache miss for $target/$build_id: no cached fingerprint" >&2
+  elif [[ "$cache_fp" != "$fp" ]]; then
+    echo "RPM cache miss for $target/$build_id: fingerprint changed" >&2
+  else
+    echo "RPM cache miss for $target/$build_id: cached RPM artifacts missing" >&2
   fi
 
   fresh_dir "$work";
@@ -1681,7 +1764,7 @@ rpm_sign_index_dir(){
     rpm --checksig "$file"
   done
 
-  createrepo_c "$dir"
+  rpm_update_local_repo "$dir"
   gpg --batch --yes --armor --detach-sign "$dir/repodata/repomd.xml"
 }
 
@@ -1875,7 +1958,7 @@ rpm_build_targets(){
     IFS=$'\t' read -r family arch repo_path repo_id repo_file label < <(repo_info rpm "$PRIMARY_APP" "$target")
 
     mkdir -p "$PUBLIC_DIR/$repo_path/source" "/work/localrepo-$target"
-    createrepo_c "/work/localrepo-$target"
+    rpm_update_local_repo "/work/localrepo-$target"
 
     qdir="$(rpm_prepare_target_queue "$target" "$family")"
     ordered_queue_files \
