@@ -1503,16 +1503,8 @@ rpm_download_expanded_sources_host(){
         tmp="$cache_file.tmp.$$"
         dest="$spec_dir/$filename"
 
-        if [[ "${CACHE_MODE:-normal}" == off ]]; then
-          echo "Downloading source with cache disabled: $download_url -> $filename" >&2
-          if ! curl -fL --retry 3 --retry-delay 2 -o "$dest" "$download_url"; then
-            rm -f "$dest"
-            die "Failed to download source: $source"
-          fi
-          [[ -s "$dest" ]] || die "Downloaded source is empty: $source"
-        elif [[ -s "$cache_file" ]]; then
+        if [[ -s "$cache_file" ]]; then
           echo "Using cached source: $source -> $filename" >&2
-          cp "$cache_file" "$dest"
         else
           echo "Downloading source: $download_url -> $filename" >&2
           rm -f "$tmp"
@@ -1525,8 +1517,9 @@ rpm_download_expanded_sources_host(){
             die "Downloaded source is empty: $source"
           fi
           mv "$tmp" "$cache_file"
-          cp "$cache_file" "$dest"
         fi
+
+        cp "$cache_file" "$dest"
         ;;
       *://*)
         die "Unsupported remote source URL scheme after RPM macro expansion: $source"
@@ -1634,26 +1627,64 @@ rpm_copy_artifacts(){
   rpm_update_local_repo "$local_repo"
 }
 
-
 rpm_cache_mode(){
   case "${CACHE_MODE:-normal}" in
-    normal|debug|off)
-      printf '%s' "${CACHE_MODE:-normal}"
-      ;;
-    *)
-      die "Unsupported cache-mode: ${CACHE_MODE}. Expected normal, debug, or off."
-      ;;
+    normal|debug|off) printf '%s' "${CACHE_MODE:-normal}" ;;
+    *) die "Unsupported CACHE_MODE: ${CACHE_MODE}. Expected normal, debug, or off." ;;
   esac
 }
 
 rpm_cache_has_binary_rpms(){
   local cache="$1"
 
-  [[ -d "$cache" ]] || return 1
-  find "$cache" -maxdepth 1 -type f -name '*.rpm' ! -name '*.src.rpm' -print -quit | grep -q .
+  find "$cache" -maxdepth 1 -type f \
+    -name '*.rpm' \
+    ! -name '*.src.rpm' \
+    -print -quit | grep -q .
 }
 
-rpm_queue_fingerprint(){
+rpm_queue_quick_fingerprint(){
+  local target="$1"
+  local family="$2"
+  local arch="$3"
+  local root="$4"
+  local spec="$5"
+  local source_id="$6"
+  local subdir="$7"
+  local base layered file
+
+  base="${spec%.spec}"
+
+  {
+    printf '%s\n' "rpm-queue-quick-fingerprint-v1" "$source_id" "$subdir" "$spec" "$target" "$arch"
+
+    if layered="$(layered_best_file "$root" "$family" "$target" specs "$spec")"; then
+      [[ -n "$layered" ]] && sha256_file "$layered"
+    fi
+
+    while IFS= read -r file; do
+      sha256_file "$file"
+    done < <(layered_existing_files "$root" "$family" "$target" patches "$spec.patch")
+
+    while IFS= read -r file; do
+      sha256_file "$file"
+    done < <(layered_existing_files "$root" "$family" "$target" patches "$base.source.patch")
+
+    while IFS= read -r file; do
+      sha256_file "$file"
+    done < <(layered_files "$root" "$family" "$target" 'macros/*.macros')
+
+    while IFS= read -r file; do
+      sha256_file "$file"
+    done < <(layered_files "$root" "$family" "$target" 'replacements/*.sed')
+
+    while IFS= read -r file; do
+      sha256_file "$file"
+    done < <(rpm_layered_repo_files "$root" "$family" "$target")
+  } | sha256_lines
+}
+
+rpm_queue_srpm_fingerprint(){
   local target="$1"
   local family="$2"
   local arch="$3"
@@ -1667,13 +1698,9 @@ rpm_queue_fingerprint(){
   [[ -f "$srpm" ]] || die "Missing SRPM for cache fingerprint: $srpm"
 
   {
-    printf '%s\n' "rpm-queue-fingerprint-v3" "$source_id" "$subdir" "$spec" "$target" "$arch"
-    printf 'srpm %s\n' "$(sha256_file "$srpm")"
+    printf '%s\n' "rpm-queue-srpm-fingerprint-v1" "$source_id" "$subdir" "$spec" "$target" "$arch"
+    sha256_file "$srpm"
 
-    # The SRPM hash captures the effective spec, downloaded Source files,
-    # package source patches, spec patch effects, versions, and release. Repo
-    # fragments are not inside the SRPM, but they can change dependency
-    # resolution and therefore binary output, so include them separately.
     while IFS= read -r file; do
       sha256_file "$file"
     done < <(rpm_layered_repo_files "$root" "$family" "$target")
@@ -1682,7 +1709,9 @@ rpm_queue_fingerprint(){
 
 rpm_build_queued(){
   local qfile="$1" target="$2" family="$3" arch="$4" repo_path="$5"
-  local build_id cache work srpm_dir result repo src_repo local_repo root fp cache_fp spec_path spec_dir url srpm mode
+  local build_id cache work srpm_dir result repo src_repo local_repo root mode
+  local quick_fp cached_quick_fp fp cache_fp spec_path spec_dir url srpm
+
   load_queue "$qfile"
   build_id="${SUBDIR//\//_}"
   cache="/package-cache/rpm/$PRIMARY_APP/$target/$build_id"
@@ -1698,10 +1727,27 @@ rpm_build_queued(){
   mkdir -p "$cache" "$result" "$repo" "$src_repo" "$local_repo"
   rpm_update_local_repo "$local_repo"
 
-  if [[ "$mode" == debug ]] && rpm_cache_has_binary_rpms "$cache"; then
-    echo "Using existing cached binary RPM artifacts for $target/$build_id without fingerprint check" >&2
-    rpm_copy_artifacts "$cache" "$repo" "$src_repo" "$local_repo"
-    return 0
+  quick_fp="$(rpm_queue_quick_fingerprint "$target" "$family" "$arch" "$root" "$SPEC" "${SOURCE_ID:-$PRIMARY_APP}" "$SUBDIR")"
+
+  if [[ "$mode" == debug ]]; then
+    cached_quick_fp=""
+    [[ -f "$cache/.quick-fingerprint" ]] && cached_quick_fp="$(cat "$cache/.quick-fingerprint")"
+
+    if [[ "$cached_quick_fp" == "$quick_fp" ]] && rpm_cache_has_binary_rpms "$cache"; then
+      echo "Using debug cached RPM artifacts for $target/$build_id: quick fingerprint matched" >&2
+      rpm_copy_artifacts "$cache" "$repo" "$src_repo" "$local_repo"
+      return 0
+    fi
+
+    if [[ -z "$cached_quick_fp" ]]; then
+      echo "RPM debug cache miss for $target/$build_id: no cached quick fingerprint" >&2
+    elif [[ "$cached_quick_fp" != "$quick_fp" ]]; then
+      echo "RPM debug cache miss for $target/$build_id: quick fingerprint changed" >&2
+    else
+      echo "RPM debug cache miss for $target/$build_id: cached binary RPM artifacts missing" >&2
+    fi
+  elif [[ "$mode" == off ]]; then
+    echo "RPM cache disabled for $target/$build_id" >&2
   fi
 
   fresh_dir "$work"
@@ -1719,41 +1765,33 @@ rpm_build_queued(){
   srpm="$(find "$srpm_dir" -maxdepth 1 -name '*.src.rpm' -print -quit)"
   [[ -n "$srpm" ]] || die "No SRPM created for $target/$build_id"
 
-  fp="$(rpm_queue_fingerprint "$target" "$family" "$arch" "$root" "$SPEC" "${SOURCE_ID:-$PRIMARY_APP}" "$SUBDIR" "$srpm")"
+  fp="$(rpm_queue_srpm_fingerprint "$target" "$family" "$arch" "$root" "$SPEC" "${SOURCE_ID:-$PRIMARY_APP}" "$SUBDIR" "$srpm")"
 
-  if [[ "$mode" == normal || "$mode" == debug ]]; then
+  if [[ "$mode" != off ]]; then
     cache_fp=""
     [[ -f "$cache/.fingerprint" ]] && cache_fp="$(cat "$cache/.fingerprint")"
 
     if [[ "$cache_fp" == "$fp" ]] && rpm_cache_has_binary_rpms "$cache"; then
-      echo "Using cached binary RPM artifacts for $target/$build_id" >&2
-      rpm_copy_one "$srpm" "$repo" "$src_repo" "$local_repo"
+      echo "Using cached RPM artifacts for $target/$build_id: SRPM fingerprint matched" >&2
+      printf '%s' "$quick_fp" >"$cache/.quick-fingerprint"
       rpm_copy_artifacts "$cache" "$repo" "$src_repo" "$local_repo"
       return 0
     fi
 
-    if [[ "$mode" == debug ]]; then
-      echo "RPM debug cache miss for $target/$build_id: no existing cached binary RPM artifacts" >&2
-    elif [[ -z "$cache_fp" ]]; then
-      echo "RPM cache miss for $target/$build_id: no cached fingerprint" >&2
+    if [[ -z "$cache_fp" ]]; then
+      echo "RPM cache miss for $target/$build_id: no cached SRPM fingerprint" >&2
     elif [[ "$cache_fp" != "$fp" ]]; then
-      echo "RPM cache miss for $target/$build_id: SRPM or build inputs changed" >&2
+      echo "RPM cache miss for $target/$build_id: SRPM or repository inputs changed" >&2
     else
       echo "RPM cache miss for $target/$build_id: cached binary RPM artifacts missing" >&2
     fi
-  else
-    echo "RPM cache disabled for $target/$build_id" >&2
   fi
 
   RPM_LAYER_ROOT="$root" rpm_rebuild "$target" "$target-$build_id" "$result" "$local_repo" "$srpm" "$spec_path" "$url"
-
-  if [[ "$mode" != off ]]; then
-    rm -f "$cache"/*.rpm
-    find "$result" -name '*.rpm' ! -name '*.src.rpm' -type f -exec cp {} "$cache/" \;
-    printf '%s' "$fp" >"$cache/.fingerprint"
-  fi
-
-  rpm_copy_one "$srpm" "$repo" "$src_repo" "$local_repo"
+  rm -f "$cache"/*.rpm "$cache"/*.src.rpm
+  find "$result" -name '*.rpm' -type f -exec cp {} "$cache/" \;
+  printf '%s' "$fp" >"$cache/.fingerprint"
+  printf '%s' "$quick_fp" >"$cache/.quick-fingerprint"
   rpm_copy_artifacts "$result" "$repo" "$src_repo" "$local_repo" 1
 }
 
@@ -1957,6 +1995,8 @@ rpm_prepare_target_queue(){
 rpm_build_targets(){
   local target family arch repo_path repo_id repo_file label qdir qfile
   local qfiles=()
+
+  echo "RPM cache mode: $(rpm_cache_mode)" >&2
 
   while IFS= read -r target; do
     echo "==> RPM target: $target"
