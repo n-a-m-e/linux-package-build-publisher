@@ -2,6 +2,16 @@
 
 # GitHub Actions, Pages, cache, and container orchestration.
 
+validate_cache_mode(){
+  case "${CACHE_MODE:-normal}" in
+    normal|debug|off)
+      ;;
+    *)
+      die "Unsupported cache-mode: ${CACHE_MODE}. Expected normal, debug, or off."
+      ;;
+  esac
+}
+
 cached_builder_image(){
   local package_type="$1"
   local base_image="$2"
@@ -51,11 +61,16 @@ build_inside_container(){
   load_apps_sources "${APP:-}" "${SOURCE_GIT:-}"
   ensure_dir /work/public
 
-  rm -rf "$METADATA_DIR"
-  ensure_dir "$METADATA_DIR"
-  : >"$METADATA_DIR/packages.txt"
-  : >"$METADATA_DIR/repos.tsv"
-  : >"$METADATA_DIR/targets.txt"
+  if [[ "${BUILDER_GROUP_INDEX:-0}" == 0 ]]; then
+    rm -rf "$METADATA_DIR"
+    ensure_dir "$METADATA_DIR"
+    : >"$METADATA_DIR/packages.txt"
+    : >"$METADATA_DIR/repos.tsv"
+    : >"$METADATA_DIR/targets.txt"
+  else
+    ensure_dir "$METADATA_DIR"
+    touch "$METADATA_DIR/packages.txt" "$METADATA_DIR/repos.tsv" "$METADATA_DIR/targets.txt"
+  fi
 
   setup_gpg
 
@@ -129,17 +144,19 @@ cmd_build_container(){
   fi
 
   local package_type="${PACKAGE_TYPE:?}"
-  local target family arch
-  local base_image=""
-  local build_cmd=""
-  local first_target=""
-  local target_image target_build_cmd
-  local image cache_key cache_root
-  local env_args=(-e PUBLIC_ROOT=/work/public -e PACKAGE_BUILD_QUEUE_DIR=/work/package-build-queue)
+  local target family arch target_image target_build_cmd group_id group_dir group_count group_index group_targets group_image group_build_cmd image
+  local cache_root var value spec name path
+  local env_args_common=(-e PUBLIC_ROOT=/work/public -e PACKAGE_BUILD_QUEUE_DIR=/work/package-build-queue)
   local cache_args=()
-  local var value spec name path
+  local groups=()
+  local config_file
 
+  validate_cache_mode
   validate_targets "$package_type"
+
+  group_dir="$ROOT/.builder-groups/$package_type"
+  rm -rf "$group_dir"
+  mkdir -p "$group_dir"
 
   while IFS= read -r target; do
     [[ -n "$target" ]] || continue
@@ -149,61 +166,60 @@ cmd_build_container(){
     target_build_cmd="${TARGET_CONTAINER_BUILD_CMD:-}"
     [[ -n "$target_build_cmd" ]] || die "Missing TARGET_CONTAINER_BUILD_CMD for $package_type target: $target"
 
-    if [[ -z "$first_target" ]]; then
-      first_target="$target"
-      base_image="$target_image"
-      build_cmd="$target_build_cmd"
-      continue
+    group_id="$(
+      {
+        printf 'package_type=%s\n' "$package_type"
+        printf 'image=%s\n' "$target_image"
+        printf 'build_cmd=%s\n' "$target_build_cmd"
+      } | sha256_lines
+    )"
+    group_id="${group_id:0:16}"
+
+    if [[ ! -f "$group_dir/$group_id.targets" ]]; then
+      groups+=("$group_id")
+      printf '%s' "$target_image" >"$group_dir/$group_id.image"
+      printf '%s' "$target_build_cmd" >"$group_dir/$group_id.build-cmd"
+      : >"$group_dir/$group_id.targets"
     fi
 
-    [[ "$target_image" == "$base_image" ]] ||
-      die "Targets use different TARGET_CONTAINER_IMAGE values: $first_target uses '$base_image', but $target uses '$target_image'"
-
-    [[ "$target_build_cmd" == "$build_cmd" ]] ||
-      die "Targets use different TARGET_CONTAINER_BUILD_CMD values: $first_target and $target differ"
+    printf '%s\n' "$target" >>"$group_dir/$group_id.targets"
   done < <(targets_list)
 
-  [[ -n "$first_target" ]] || die "$package_type requires targets."
+  ((${#groups[@]})) || die "$package_type requires targets."
 
-  image="$(cached_builder_image "$package_type" "$base_image" "$build_cmd")"
+  cache_root="package-cache/$package_type-v$PACKAGE_CACHE_SCHEMA"
+  mkdir -p "$cache_root"
+  {
+    printf 'cache_schema=%s\n' "$PACKAGE_CACHE_SCHEMA"
+    printf 'package_type=%s\n' "$package_type"
+    printf 'cache_mode=%s\n' "${CACHE_MODE:-normal}"
+    printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'builder_groups=%s\n' "${#groups[@]}"
 
-  cache_key="$(
-    {
-      printf 'cache_schema=%s\n' "$PACKAGE_CACHE_SCHEMA"
-      printf 'package_type=%s\n' "$package_type"
+    group_index=0
+    for group_id in "${groups[@]}"; do
+      group_image="$(cat "$group_dir/$group_id.image")"
+      group_build_cmd="$(cat "$group_dir/$group_id.build-cmd")"
+      printf '\n[group %s]\n' "$group_index"
+      printf 'id=%s\n' "$group_id"
+      printf 'image=%s\n' "$group_image"
+      printf 'build_cmd_sha256=%s\n' "$(printf '%s' "$group_build_cmd" | sha256_lines)"
 
       while IFS= read -r target; do
         [[ -n "$target" ]] || continue
         IFS=$'\t' read -r family arch < <(split_target "$target")
         config_file="$(find_target_config "$package_type" "$family" "$arch")"
-
         printf 'target=%s\n' "$target"
         printf 'config=%s\n' "${config_file#$ROOT/}"
-        printf 'sha256=%s\n' "$(sha256_file "$config_file")"
-      done < <(targets_list)
-    } | sha256_lines
-  )"
-  cache_key="$package_type-v$PACKAGE_CACHE_SCHEMA-${cache_key:0:16}"
-  cache_root="package-cache/$cache_key"
-  mkdir -p "$cache_root"
-  {
-    printf 'cache_schema=%s\n' "$PACKAGE_CACHE_SCHEMA"
-    printf 'package_type=%s\n' "$package_type"
-    printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-    while IFS= read -r target; do
-      [[ -n "$target" ]] || continue
-      IFS=$'\t' read -r family arch < <(split_target "$target")
-      config_file="$(find_target_config "$package_type" "$family" "$arch")"
-
-      printf 'target=%s\n' "$target"
-      printf 'config=%s\n' "${config_file#$ROOT/}"
-      printf 'sha256=%s\n' "$(sha256_file "$config_file")"
-    done < <(targets_list)
+        printf 'config_sha256=%s\n' "$(sha256_file "$config_file")"
+      done <"$group_dir/$group_id.targets"
+      group_index=$((group_index + 1))
+    done
   } >"$cache_root/.repository-builder-cache-manifest"
   echo "Using package cache: $cache_root"
 
   for var in "${HOST_ENV_VARS[@]}"; do
+    [[ "$var" != TARGETS ]] || continue
     [[ -n "${!var+x}" ]] || continue
 
     value="${!var}"
@@ -211,7 +227,7 @@ cmd_build_container(){
       value="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$value")"
     fi
 
-    env_args+=(-e "$var=$value")
+    env_args_common+=(-e "$var=$value")
   done
 
   for spec in "${CACHE_MOUNTS[@]}"; do
@@ -221,19 +237,35 @@ cmd_build_container(){
     cache_args+=(-v "$PWD/$cache_root/$name:$path")
   done
 
-  docker run \
-    --rm \
-    --privileged \
-    -v "$PWD:/work/workspace" \
-    -v "$PWD/publisher:/work/publisher" \
-    -v "$PWD/public:/work/public" \
-    -v "$PWD/gpg-key:/work/gpg-key" \
-    -v "$PWD/$cache_root:/package-cache" \
-    "${cache_args[@]}" \
-    -w /work/workspace \
-    "${env_args[@]}" \
-    "$image" \
-    bash /work/publisher/repository_builder.sh build-container --inside-container
+  group_count="${#groups[@]}"
+  group_index=0
+  for group_id in "${groups[@]}"; do
+    group_image="$(cat "$group_dir/$group_id.image")"
+    group_build_cmd="$(cat "$group_dir/$group_id.build-cmd")"
+    group_targets="$(cat "$group_dir/$group_id.targets")"
+    image="$(cached_builder_image "$package_type" "$group_image" "$group_build_cmd")"
+
+    echo "==> Builder group $((group_index + 1))/$group_count: image=$group_image targets=$(tr '\n' ' ' <"$group_dir/$group_id.targets" | sed 's/[[:space:]]*$//')"
+
+    docker run \
+      --rm \
+      --privileged \
+      -v "$PWD:/work/workspace" \
+      -v "$PWD/publisher:/work/publisher" \
+      -v "$PWD/public:/work/public" \
+      -v "$PWD/gpg-key:/work/gpg-key" \
+      -v "$PWD/$cache_root:/package-cache" \
+      "${cache_args[@]}" \
+      -w /work/workspace \
+      "${env_args_common[@]}" \
+      -e "TARGETS=$group_targets" \
+      -e "BUILDER_GROUP_INDEX=$group_index" \
+      -e "BUILDER_GROUP_COUNT=$group_count" \
+      "$image" \
+      bash /work/publisher/repository_builder.sh build-container --inside-container
+
+    group_index=$((group_index + 1))
+  done
 }
 
 cmd_prepare(){
@@ -243,6 +275,7 @@ cmd_prepare(){
   local targets=()
 
   [[ " $PACKAGE_TYPES " == *" $package_type "* ]] || die "Unsupported package-type: $package_type"
+  validate_cache_mode
 
   pages="$(gh api "repos/${GITHUB_REPOSITORY:?}/pages" --jq .build_type)"
   [[ "$pages" == workflow ]] || die "Enable GitHub Pages with Source set to GitHub Actions."
