@@ -123,16 +123,36 @@ deb_graph_finalize(){
   graph_emit_edges "$graph/providers.tsv" "$graph/raw-runtimedeps.tsv" "$graph/runtimedeps.tsv"
 }
 
+
+deb_cache_mode(){
+  case "${CACHE_MODE:-normal}" in
+    normal|debug|off) printf '%s' "${CACHE_MODE:-normal}" ;;
+    *) die "Unsupported CACHE_MODE: ${CACHE_MODE}. Expected normal, debug, or off." ;;
+  esac
+}
+
 deb_ensure_pbuilder(){
   local target="$1"
   local suite="$2"
   local arch="$3"
   local mirror="$4"
   local base="/package-cache/deb/pbuilder/$target/base.tgz"
+  local tmp mode
 
   mkdir -p "$(dirname "$base")"
+  mode="$(deb_cache_mode)"
 
-  if [[ ! -f "$base" ]]; then
+  if [[ "$mode" == off ]]; then
+    echo "DEB cache disabled for read on $target; rebuilding pbuilder base tarball" >&2
+    tmp="$base.tmp.$$"
+    rm -f "$tmp"
+    if pbuilder --create --basetgz "$tmp" --distribution "$suite" --architecture "$arch" --mirror "$mirror" --debootstrapopts --variant=buildd; then
+      mv "$tmp" "$base"
+    else
+      rm -f "$tmp"
+      return 1
+    fi
+  elif [[ ! -f "$base" ]]; then
     pbuilder --create --basetgz "$base" --distribution "$suite" --architecture "$arch" --mirror "$mirror" --debootstrapopts --variant=buildd
   else
     pbuilder --update --basetgz "$base"
@@ -220,6 +240,8 @@ EOF
 deb_build_targets(){
   local target family arch repo_path repo_id repo_file label qfile
   local qfiles=()
+
+  echo "DEB cache mode: $(deb_cache_mode)" >&2
 
   while IFS= read -r target; do
     echo "==> DEB target: $target"
