@@ -1662,23 +1662,6 @@ rpm_target_config_fingerprint(){
   } | sha256_lines
 }
 
-rpm_stage_packaging_root_files(){
-  local staged_root="$1"
-  local spec_dir="$2"
-  local file dest
-
-  [[ -d "$staged_root" && -d "$spec_dir" ]] || return 0
-  [[ "$spec_dir" != "$staged_root" ]] || return 0
-
-  while IFS= read -r file; do
-    dest="$spec_dir/$(basename "$file")"
-    [[ -e "$dest" ]] || cp "$file" "$dest"
-  done < <(find "$staged_root" -maxdepth 1 -type f \
-    ! -name '*.rpm' \
-    ! -name '*.src.rpm' \
-    -print | sort)
-}
-
 rpm_packaging_tree_fingerprint(){
   local dir="$1"
   local file
@@ -1715,7 +1698,7 @@ rpm_queue_quick_fingerprint(){
   packaging_fp="$(rpm_packaging_tree_fingerprint "$staged_root")"
 
   {
-    printf '%s\n' "rpm-queue-quick-fingerprint-v3" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$packaging_fp"
+    printf '%s\n' "rpm-queue-quick-fingerprint-v4" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$packaging_fp"
   } | sha256_lines
 }
 
@@ -1735,7 +1718,7 @@ rpm_queue_srpm_fingerprint(){
   packaging_fp="$(rpm_packaging_tree_fingerprint "$staged_root")"
 
   {
-    printf '%s\n' "rpm-queue-srpm-fingerprint-v3" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$packaging_fp"
+    printf '%s\n' "rpm-queue-srpm-fingerprint-v4" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$packaging_fp"
     sha256_file "$srpm"
   } | sha256_lines
 }
@@ -1771,7 +1754,6 @@ rpm_build_queued(){
     die "RPM spec preparation failed for $SPEC on $target"
   fi
   spec_dir="$(dirname "$spec_path")"
-  rpm_stage_packaging_root_files "$work/src" "$spec_dir"
   url="https://example.invalid/$SPEC"
 
   quick_fp="$(rpm_queue_quick_fingerprint "$target" "$family" "$arch" "$work/src" "$SPEC" "$source_id" "$SUBDIR")"
@@ -2052,11 +2034,11 @@ rpm_prepare_target_queue(){
         PACKAGE="$package" \
         SOURCE_ID="$source_id" >/dev/null
       metadata_append_package "$package"
-    done < <(find "$root" -maxdepth 2 -type f -name '*.spec' \
+    done < <(find "$root" \
+      -type d \( -name .git -o -name .github -o -name .cache -o -name __pycache__ -o -name BUILD -o -name RPMS -o -name SRPMS -o -name SOURCES -o -name tmp \) -prune \
+      -o -type f -name '*.spec' \
       ! -path "$root/specs/*" \
-      ! -path "$root/.git/*" \
-      ! -path "$root/.github/*" \
-      | sort)
+      -print | sort)
   done
 
   printf '%s' "$qdir"
