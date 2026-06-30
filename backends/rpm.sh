@@ -1662,45 +1662,60 @@ rpm_target_config_fingerprint(){
   } | sha256_lines
 }
 
+rpm_stage_packaging_root_files(){
+  local staged_root="$1"
+  local spec_dir="$2"
+  local file dest
+
+  [[ -d "$staged_root" && -d "$spec_dir" ]] || return 0
+  [[ "$spec_dir" != "$staged_root" ]] || return 0
+
+  while IFS= read -r file; do
+    dest="$spec_dir/$(basename "$file")"
+    [[ -e "$dest" ]] || cp "$file" "$dest"
+  done < <(find "$staged_root" -maxdepth 1 -type f \
+    ! -name '*.rpm' \
+    ! -name '*.src.rpm' \
+    -print | sort)
+}
+
+rpm_packaging_tree_fingerprint(){
+  local dir="$1"
+  local file
+
+  [[ -d "$dir" ]] || die "Missing RPM packaging staging directory for fingerprint: $dir"
+
+  (
+    cd "$dir"
+    {
+      find . \
+        -type d \( -name .git -o -name .github -o -name .cache -o -name __pycache__ \) -prune \
+        -o -type f \
+        ! -name '*.rpm' \
+        ! -name '*.src.rpm' \
+        -print | sort | while IFS= read -r file; do
+          file="${file#./}"
+          printf '%s  %s\n' "$(sha256_file "$file")" "$file"
+        done
+    } | sha256_lines
+  )
+}
+
 rpm_queue_quick_fingerprint(){
   local target="$1"
   local family="$2"
   local arch="$3"
-  local root="$4"
+  local staged_root="$4"
   local spec="$5"
   local source_id="$6"
   local subdir="$7"
-  local base layered file target_config_fp
+  local target_config_fp packaging_fp
 
-  base="${spec%.spec}"
   target_config_fp="$(rpm_target_config_fingerprint rpm "$family" "$arch")"
+  packaging_fp="$(rpm_packaging_tree_fingerprint "$staged_root")"
 
   {
-    printf '%s\n' "rpm-queue-quick-fingerprint-v2" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp"
-
-    if layered="$(layered_best_file "$root" "$family" "$target" specs "$spec")"; then
-      [[ -n "$layered" ]] && sha256_file "$layered"
-    fi
-
-    while IFS= read -r file; do
-      sha256_file "$file"
-    done < <(layered_existing_files "$root" "$family" "$target" patches "$spec.patch")
-
-    while IFS= read -r file; do
-      sha256_file "$file"
-    done < <(layered_existing_files "$root" "$family" "$target" patches "$base.source.patch")
-
-    while IFS= read -r file; do
-      sha256_file "$file"
-    done < <(layered_files "$root" "$family" "$target" 'macros/*.macros')
-
-    while IFS= read -r file; do
-      sha256_file "$file"
-    done < <(layered_files "$root" "$family" "$target" 'replacements/*.sed')
-
-    while IFS= read -r file; do
-      sha256_file "$file"
-    done < <(rpm_layered_repo_files "$root" "$family" "$target")
+    printf '%s\n' "rpm-queue-quick-fingerprint-v3" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$packaging_fp"
   } | sha256_lines
 }
 
@@ -1708,68 +1723,46 @@ rpm_queue_srpm_fingerprint(){
   local target="$1"
   local family="$2"
   local arch="$3"
-  local root="$4"
+  local staged_root="$4"
   local spec="$5"
   local source_id="$6"
   local subdir="$7"
   local srpm="$8"
-  local file target_config_fp
+  local target_config_fp packaging_fp
 
   [[ -f "$srpm" ]] || die "Missing SRPM for cache fingerprint: $srpm"
   target_config_fp="$(rpm_target_config_fingerprint rpm "$family" "$arch")"
+  packaging_fp="$(rpm_packaging_tree_fingerprint "$staged_root")"
 
   {
-    printf '%s\n' "rpm-queue-srpm-fingerprint-v2" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp"
+    printf '%s\n' "rpm-queue-srpm-fingerprint-v3" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$packaging_fp"
     sha256_file "$srpm"
-
-    while IFS= read -r file; do
-      sha256_file "$file"
-    done < <(rpm_layered_repo_files "$root" "$family" "$target")
   } | sha256_lines
 }
 
 rpm_build_queued(){
   local qfile="$1" target="$2" family="$3" arch="$4" repo_path="$5"
-  local build_id cache work srpm_dir result repo src_repo local_repo root mode
+  local source_id source_safe package_id build_id display_id cache work srpm_dir result repo src_repo local_repo root mode
   local quick_fp cached_quick_fp fp cache_fp spec_path spec_dir url srpm
 
   load_queue "$qfile"
-  build_id="${SUBDIR//\//_}"
-  cache="/package-cache/rpm/$PRIMARY_APP/$target/$build_id"
-  work="/work/rpm-build/$target/$build_id"
-  srpm_dir="/work/rpm-srpm/$target/$build_id"
-  result="/work/rpm-result/$target/$build_id"
+  source_id="${SOURCE_ID:-$PRIMARY_APP}"
+  source_safe="$(safe_id "$source_id")"
+  package_id="${PACKAGE:-${SPEC%.spec}}"
+  build_id="$(safe_id "$package_id")"
+  display_id="$source_id/$build_id"
+  cache="/package-cache/rpm/$PRIMARY_APP/$target/$source_safe/$build_id"
+  work="/work/rpm-build/$target/$source_safe/$build_id"
+  srpm_dir="/work/rpm-srpm/$target/$source_safe/$build_id"
+  result="/work/rpm-result/$target/$source_safe/$build_id"
   repo="$PUBLIC_DIR/$repo_path"
   src_repo="$repo/source"
   local_repo="/work/localrepo-$target"
-  root="/work/work/${SOURCE_ID:-$PRIMARY_APP}"
+  root="/work/work/$source_id"
   mode="$(rpm_cache_mode)"
 
   mkdir -p "$cache" "$result" "$repo" "$src_repo" "$local_repo"
   rpm_update_local_repo "$local_repo"
-
-  quick_fp="$(rpm_queue_quick_fingerprint "$target" "$family" "$arch" "$root" "$SPEC" "${SOURCE_ID:-$PRIMARY_APP}" "$SUBDIR")"
-
-  if [[ "$mode" == debug ]]; then
-    cached_quick_fp=""
-    [[ -f "$cache/.quick-fingerprint" ]] && cached_quick_fp="$(cat "$cache/.quick-fingerprint")"
-
-    if [[ "$cached_quick_fp" == "$quick_fp" ]] && rpm_cache_has_binary_rpms "$cache"; then
-      echo "Using debug cached RPM artifacts for $target/$build_id: quick fingerprint matched" >&2
-      rpm_copy_artifacts "$cache" "$repo" "$src_repo" "$local_repo"
-      return 0
-    fi
-
-    if [[ -z "$cached_quick_fp" ]]; then
-      echo "RPM debug cache miss for $target/$build_id: no cached quick fingerprint" >&2
-    elif [[ "$cached_quick_fp" != "$quick_fp" ]]; then
-      echo "RPM debug cache miss for $target/$build_id: quick fingerprint changed" >&2
-    else
-      echo "RPM debug cache miss for $target/$build_id: cached binary RPM artifacts missing" >&2
-    fi
-  elif [[ "$mode" == off ]]; then
-    echo "RPM cache disabled for $target/$build_id" >&2
-  fi
 
   fresh_dir "$work"
   fresh_dir "$srpm_dir"
@@ -1778,37 +1771,61 @@ rpm_build_queued(){
     die "RPM spec preparation failed for $SPEC on $target"
   fi
   spec_dir="$(dirname "$spec_path")"
+  rpm_stage_packaging_root_files "$work/src" "$spec_dir"
   url="https://example.invalid/$SPEC"
+
+  quick_fp="$(rpm_queue_quick_fingerprint "$target" "$family" "$arch" "$work/src" "$SPEC" "$source_id" "$SUBDIR")"
+
+  if [[ "$mode" == debug ]]; then
+    cached_quick_fp=""
+    [[ -f "$cache/.quick-fingerprint" ]] && cached_quick_fp="$(cat "$cache/.quick-fingerprint")"
+
+    if [[ "$cached_quick_fp" == "$quick_fp" ]] && rpm_cache_has_binary_rpms "$cache"; then
+      echo "Using debug cached RPM artifacts for $target/$display_id: quick fingerprint matched" >&2
+      rpm_copy_artifacts "$cache" "$repo" "$src_repo" "$local_repo"
+      return 0
+    fi
+
+    if [[ -z "$cached_quick_fp" ]]; then
+      echo "RPM debug cache miss for $target/$display_id: no cached quick fingerprint" >&2
+    elif [[ "$cached_quick_fp" != "$quick_fp" ]]; then
+      echo "RPM debug cache miss for $target/$display_id: quick fingerprint changed" >&2
+    else
+      echo "RPM debug cache miss for $target/$display_id: cached binary RPM artifacts missing" >&2
+    fi
+  elif [[ "$mode" == off ]]; then
+    echo "RPM cache disabled for $target/$display_id" >&2
+  fi
 
   RPM_LAYER_ROOT="$root" rpm_fetch_sources_in_mock "$target" "$result" "$spec_dir" "$SPEC"
 
-  RPM_LAYER_ROOT="$root" rpm_build_srpm "$target" "srpm-$target-$build_id" "$srpm_dir" "$spec_dir" "$spec_path" "$url"
+  RPM_LAYER_ROOT="$root" rpm_build_srpm "$target" "srpm-$target-$source_safe-$build_id" "$srpm_dir" "$spec_dir" "$spec_path" "$url"
   srpm="$(find "$srpm_dir" -maxdepth 1 -name '*.src.rpm' -print -quit)"
-  [[ -n "$srpm" ]] || die "No SRPM created for $target/$build_id"
+  [[ -n "$srpm" ]] || die "No SRPM created for $target/$display_id"
 
-  fp="$(rpm_queue_srpm_fingerprint "$target" "$family" "$arch" "$root" "$SPEC" "${SOURCE_ID:-$PRIMARY_APP}" "$SUBDIR" "$srpm")"
+  fp="$(rpm_queue_srpm_fingerprint "$target" "$family" "$arch" "$work/src" "$SPEC" "$source_id" "$SUBDIR" "$srpm")"
 
   if [[ "$mode" != off ]]; then
     cache_fp=""
     [[ -f "$cache/.fingerprint" ]] && cache_fp="$(cat "$cache/.fingerprint")"
 
     if [[ "$cache_fp" == "$fp" ]] && rpm_cache_has_binary_rpms "$cache"; then
-      echo "Using cached RPM artifacts for $target/$build_id: SRPM fingerprint matched" >&2
+      echo "Using cached RPM artifacts for $target/$display_id: SRPM fingerprint matched" >&2
       printf '%s' "$quick_fp" >"$cache/.quick-fingerprint"
       rpm_copy_artifacts "$cache" "$repo" "$src_repo" "$local_repo"
       return 0
     fi
 
     if [[ -z "$cache_fp" ]]; then
-      echo "RPM cache miss for $target/$build_id: no cached SRPM fingerprint" >&2
+      echo "RPM cache miss for $target/$display_id: no cached SRPM fingerprint" >&2
     elif [[ "$cache_fp" != "$fp" ]]; then
-      echo "RPM cache miss for $target/$build_id: SRPM or repository inputs changed" >&2
+      echo "RPM cache miss for $target/$display_id: SRPM or repository inputs changed" >&2
     else
-      echo "RPM cache miss for $target/$build_id: cached binary RPM artifacts missing" >&2
+      echo "RPM cache miss for $target/$display_id: cached binary RPM artifacts missing" >&2
     fi
   fi
 
-  RPM_LAYER_ROOT="$root" rpm_rebuild "$target" "$target-$build_id" "$result" "$local_repo" "$srpm" "$spec_path" "$url"
+  RPM_LAYER_ROOT="$root" rpm_rebuild "$target" "$target-$source_safe-$build_id" "$result" "$local_repo" "$srpm" "$spec_path" "$url"
   rm -f "$cache"/*.rpm "$cache"/*.src.rpm
   find "$result" -name '*.rpm' -type f -exec cp {} "$cache/" \;
   printf '%s' "$fp" >"$cache/.fingerprint"
@@ -1862,7 +1879,7 @@ EOF
 
 rpm_graph_node_id(){
   load_queue "$1"
-  safe_id "$PACKAGE-$SUBDIR"
+  safe_id "${SOURCE_ID:-$PRIMARY_APP}-${PACKAGE:-${SPEC%.spec}}-$SUBDIR"
 }
 
 rpm_graph_collect_node(){
@@ -1989,7 +2006,9 @@ rpm_prepare_target_queue(){
   local target="$1"
   local family="$2"
   local qdir="/work/package-build-queue-target/rpm/$target"
-  local source_id root spec_name package
+  local source_id root spec_name spec_path package subdir key package_key
+  local -A queued=()
+  local -A queued_package=()
 
   fresh_dir "$qdir"
 
@@ -1998,6 +2017,10 @@ rpm_prepare_target_queue(){
 
     while IFS= read -r spec_name; do
       package="${spec_name%.spec}"
+      key="$source_id|$package|$spec_name|$package"
+      package_key="$source_id|$package"
+      queued[$key]=1
+      queued_package[$package_key]=1
       queue_write \
         "$qdir" \
         "$(safe_id "$source_id-layered-$package")" \
@@ -2008,6 +2031,32 @@ rpm_prepare_target_queue(){
         SOURCE_ID="$source_id" >/dev/null
       metadata_append_package "$package"
     done < <(layered_names "$root" "$family" "$target" specs '*.spec')
+
+    while IFS= read -r spec_path; do
+      spec_name="$(basename "$spec_path")"
+      package="${spec_name%.spec}"
+      subdir="$(dirname "${spec_path#$root/}")"
+      [[ "$subdir" == . ]] || subdir="${subdir#./}"
+      key="$source_id|$package|$spec_name|$subdir"
+      package_key="$source_id|$package"
+      [[ -z "${queued[$key]+x}" ]] || continue
+      [[ -z "${queued_package[$package_key]+x}" ]] || continue
+      queued[$key]=1
+      queued_package[$package_key]=1
+      queue_write \
+        "$qdir" \
+        "$(safe_id "$source_id-repo-$package-$subdir")" \
+        QUEUE_TYPE=rpm \
+        SUBDIR="$subdir" \
+        SPEC="$spec_name" \
+        PACKAGE="$package" \
+        SOURCE_ID="$source_id" >/dev/null
+      metadata_append_package "$package"
+    done < <(find "$root" -maxdepth 2 -type f -name '*.spec' \
+      ! -path "$root/specs/*" \
+      ! -path "$root/.git/*" \
+      ! -path "$root/.github/*" \
+      | sort)
   done
 
   printf '%s' "$qdir"
