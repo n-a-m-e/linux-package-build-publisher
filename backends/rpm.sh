@@ -1662,22 +1662,23 @@ rpm_target_config_fingerprint(){
   } | sha256_lines
 }
 
-rpm_packaging_tree_fingerprint(){
-  local dir="$1"
+rpm_package_input_fingerprint(){
+  local staged_root="$1"
+  local subdir="$2"
+  local pkg_dir="$staged_root/$subdir"
   local file
 
-  [[ -d "$dir" ]] || die "Missing RPM packaging staging directory for fingerprint: $dir"
-
+  [[ -d "$staged_root" ]] || die "Missing RPM packaging staging root for fingerprint: $staged_root"
+  [[ -d "$pkg_dir" ]] || die "Missing RPM package directory for fingerprint: $pkg_dir"
   (
-    cd "$dir"
+    cd "$staged_root"
     {
-      find . \
-        -type d \( -name .git -o -name .github -o -name .cache -o -name __pycache__ \) -prune \
+      find "$subdir" \
+        -type d \( -name .git -o -name .github -o -name .cache -o -name __pycache__ -o -name BUILD -o -name RPMS -o -name SRPMS -o -name SOURCES -o -name tmp \) -prune \
         -o -type f \
         ! -name '*.rpm' \
         ! -name '*.src.rpm' \
         -print | sort | while IFS= read -r file; do
-          file="${file#./}"
           printf '%s  %s\n' "$(sha256_file "$file")" "$file"
         done
     } | sha256_lines
@@ -1692,13 +1693,13 @@ rpm_queue_quick_fingerprint(){
   local spec="$5"
   local source_id="$6"
   local subdir="$7"
-  local target_config_fp packaging_fp
+  local target_config_fp package_fp
 
   target_config_fp="$(rpm_target_config_fingerprint rpm "$family" "$arch")"
-  packaging_fp="$(rpm_packaging_tree_fingerprint "$staged_root")"
+  package_fp="$(rpm_package_input_fingerprint "$staged_root" "$subdir")"
 
   {
-    printf '%s\n' "rpm-queue-quick-fingerprint-v4" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$packaging_fp"
+    printf '%s\n' "rpm-queue-quick-fingerprint-v5" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$package_fp"
   } | sha256_lines
 }
 
@@ -1711,14 +1712,14 @@ rpm_queue_srpm_fingerprint(){
   local source_id="$6"
   local subdir="$7"
   local srpm="$8"
-  local target_config_fp packaging_fp
+  local target_config_fp package_fp
 
   [[ -f "$srpm" ]] || die "Missing SRPM for cache fingerprint: $srpm"
   target_config_fp="$(rpm_target_config_fingerprint rpm "$family" "$arch")"
-  packaging_fp="$(rpm_packaging_tree_fingerprint "$staged_root")"
+  package_fp="$(rpm_package_input_fingerprint "$staged_root" "$subdir")"
 
   {
-    printf '%s\n' "rpm-queue-srpm-fingerprint-v4" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$packaging_fp"
+    printf '%s\n' "rpm-queue-srpm-fingerprint-v5" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$package_fp"
     sha256_file "$srpm"
   } | sha256_lines
 }
