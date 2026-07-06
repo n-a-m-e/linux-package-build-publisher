@@ -19,23 +19,64 @@ rpm_configure_signing(){
 EOF
 }
 
+rpm_mock_log_inline_candidate(){
+  local rel="$1"
+
+  # These logs are useful as saved artifacts, but very noisy inline:
+  # - installed_pkgs.log can contain hundreds of rpm-queryformat "pkgid" warnings
+  # - state.log is mostly mock lifecycle/cleanup chatter
+  # - mock-repo-debug logs contain full config/repolist dumps
+  case "$rel" in
+    installed_pkgs.log|*/installed_pkgs.log|state.log|*/state.log|mock-repo-debug/*|*/mock-repo-debug/*)
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+rpm_filter_noisy_mock_tail(){
+  awk '
+    /incorrect format: unknown tag: "pkgid"/ { next }
+    /Child return code was: 0/ { next }
+    /child environment: None/ { next }
+    index($0, "Executing command: [") && index($0, "/bin/umount") { next }
+    index($0, "Executing command: [") && index($0, "/bin/mount") { next }
+    /Start: cleaning package manager metadata/ { next }
+    /Finish: cleaning package manager metadata/ { next }
+    /Start: chroot init/ { next }
+    /Finish: chroot init/ { next }
+    /Finish: run/ { next }
+    { print }
+  '
+}
+
 rpm_dump_mock_failure(){
   local dir="$1" msg="$2" lines="${MOCK_LOG_TAIL_LINES:-200}"
-  local log found=0
+  local log rel found=0 skipped=0
 
   error "$msg"
 
   shopt -s nullglob
   for log in "$dir"/*.log "$dir"/*/*.log; do
     [[ -f "$log" ]] || continue
+    rel="${log#$dir/}"
+    if ! rpm_mock_log_inline_candidate "$rel"; then
+      skipped=$((skipped + 1))
+      continue
+    fi
     found=1
-    echo "--- ${log#$dir/} (last $lines lines) ---" >&2
-    tail -n "$lines" "$log" >&2 || true
+    echo "--- $rel (last $lines lines, filtered) ---" >&2
+    tail -n "$lines" "$log" | rpm_filter_noisy_mock_tail >&2 || true
   done
   shopt -u nullglob
 
+  if ((skipped)); then
+    echo "--- skipped $skipped noisy mock diagnostic log(s); full logs remain in the result artifacts ---" >&2
+  fi
+
   if ! ((found)); then
-    echo "--- no mock result logs found in $dir ---" >&2
+    echo "--- no primary mock result logs found in $dir ---" >&2
   fi
 }
 
