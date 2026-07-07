@@ -1631,7 +1631,7 @@ rpm_update_local_repo(){
 
   if createrepo_c --update "$dir" >"$log" 2>&1; then
     rm -f "$log"
-    echo "Updated local repo: $count packages" >&2
+    echo "Updated local repo: $count binary RPMs available" >&2
   else
     echo "createrepo_c failed for $dir" >&2
     tail -n "${MOCK_LOG_TAIL_LINES:-200}" "$log" >&2 || true
@@ -2087,7 +2087,7 @@ rpm_prepare_target_queue(){
 }
 
 rpm_build_targets(){
-  local target family arch repo_path repo_id repo_file label qdir qfile
+  local target family arch repo_path repo_id repo_file label qdir qfile index total progress_name
   local qfiles=()
 
   echo "RPM cache mode: $(rpm_cache_mode)" >&2
@@ -2109,7 +2109,17 @@ rpm_build_targets(){
       "No layered RPM specs were found for $target" \
       rpm
 
+    total="${#qfiles[@]}"
+    index=0
+
     for qfile in "${qfiles[@]}"; do
+      index=$((index + 1))
+
+      load_queue "$qfile"
+      progress_name="${PACKAGE:-${SPEC%.spec}}"
+
+      echo "[$index/$total] Building $progress_name" >&2
+
       rpm_build_queued "$qfile" "$target" "$family" "$arch" "$repo_path"
     done
 
