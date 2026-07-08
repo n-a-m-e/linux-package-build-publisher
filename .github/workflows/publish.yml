@@ -129,9 +129,41 @@ jobs:
           upload-pages-artifact: true
           upload-bundles: false
 
+      - name: Package | Delete package caches when cache is off
+        if: (inputs.package-type == 'rpm' || inputs.package-type == 'deb') && inputs.cache-mode == 'off'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_KEY_PREFIX: package-cache-${{ inputs.package-type }}-${{ runner.os }}-
+        run: |
+          set -euo pipefail
+
+          echo "CACHE_MODE=off: deleting GitHub Actions package caches with prefix: $CACHE_KEY_PREFIX"
+          deleted=0
+
+          while true; do
+            mapfile -t cache_ids < <(
+              gh cache list --key "$CACHE_KEY_PREFIX" --limit 100 --json id --jq '.[].id'
+            )
+
+            if ((${#cache_ids[@]} == 0)); then
+              break
+            fi
+
+            for cache_id in "${cache_ids[@]}"; do
+              echo "Deleting package cache id=$cache_id"
+              gh cache delete "$cache_id"
+            done
+
+            deleted=$((deleted + ${#cache_ids[@]}))
+          done
+
+          echo "Deleted $deleted package cache(s)."
+          rm -rf package-cache
+          mkdir -p package-cache
+
       - id: package-cache
         name: Package | Restore package cache
-        if: inputs.package-type == 'rpm' || inputs.package-type == 'deb'
+        if: (inputs.package-type == 'rpm' || inputs.package-type == 'deb') && inputs.cache-mode != 'off'
         uses: actions/cache/restore@v4
         with:
           path: package-cache
