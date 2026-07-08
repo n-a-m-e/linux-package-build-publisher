@@ -809,8 +809,19 @@ rpm_rebuild_phase_markers_from_log(){
   ' "$log" || true
 }
 
+rpm_rebuild_phase_markers_from_logs(){
+  local log
+
+  for log in "$@"; do
+    [[ -n "$log" && -f "$log" ]] || continue
+    rpm_rebuild_phase_markers_from_log "$log"
+  done | awk 'NF && !seen[$0]++'
+}
+
 rpm_rebuild_emit_new_phase_markers(){
-  local log="$1" reported_file="$2" package_name="$3" elapsed_text="$4"
+  local reported_file="$1" package_name="$2" elapsed_text="$3"
+  shift 3
+
   local marker emitted=0
 
   mkdir -p "$(dirname "$reported_file")"
@@ -823,13 +834,13 @@ rpm_rebuild_emit_new_phase_markers(){
       echo "RPM rebuild phase: $package_name - $marker - elapsed $elapsed_text" >&2
       emitted=1
     fi
-  done < <(rpm_rebuild_phase_markers_from_log "$log")
+  done < <(rpm_rebuild_phase_markers_from_logs "$@")
 
   [[ "$emitted" == 1 ]]
 }
 
 rpm_mock_rebuild_heartbeat_loop(){
-  local log="$1" reported_file="$2" package_name="$3" interval="$4" start="$5"
+  local result="$1" live_log="$2" reported_file="$3" package_name="$4" interval="$5" start="$6"
   local now elapsed elapsed_text
 
   while true; do
@@ -839,7 +850,15 @@ rpm_mock_rebuild_heartbeat_loop(){
     elapsed=$((now - start))
     elapsed_text="$(rpm_format_elapsed "$elapsed")"
 
-    if ! rpm_rebuild_emit_new_phase_markers "$log" "$reported_file" "$package_name" "$elapsed_text"; then
+    # mock --quiet can put the RPM phase markers in build.log rather than in
+    # the wrapper-captured stdout/stderr log, so scan both while still only
+    # printing each high-level marker once.
+    if ! rpm_rebuild_emit_new_phase_markers \
+      "$reported_file" \
+      "$package_name" \
+      "$elapsed_text" \
+      "$result/build.log" \
+      "$live_log"; then
       echo "Still building $package_name - elapsed $elapsed_text" >&2
     fi
   done
@@ -868,10 +887,10 @@ rpm_mock_rebuild_with_heartbeat(){
 
   rpm_mock_repo_debug "$result" "$target" "$effective_target" "before-${phase}-mock-rebuild-command" "${mock_args[@]}"
 
-  echo "Starting RPM rebuild: $package_name (heartbeat every ${interval}s; full output: ${live_log#$result/})" >&2
+  echo "Starting RPM rebuild: $package_name (heartbeat every ${interval}s; full output: ${live_log#$result/}; phases: build.log)" >&2
 
   start="$(date +%s)"
-  rpm_mock_rebuild_heartbeat_loop "$live_log" "$reported_file" "$package_name" "$interval" "$start" &
+  rpm_mock_rebuild_heartbeat_loop "$result" "$live_log" "$reported_file" "$package_name" "$interval" "$start" &
   heartbeat_pid="$!"
 
   if mock -r "$effective_target" "${mock_args[@]}" "$@" >"$live_log" 2>&1; then
@@ -886,7 +905,12 @@ rpm_mock_rebuild_with_heartbeat(){
   now="$(date +%s)"
   elapsed=$((now - start))
   elapsed_text="$(rpm_format_elapsed "$elapsed")"
-  rpm_rebuild_emit_new_phase_markers "$live_log" "$reported_file" "$package_name" "$elapsed_text" || true
+  rpm_rebuild_emit_new_phase_markers \
+    "$reported_file" \
+    "$package_name" \
+    "$elapsed_text" \
+    "$result/build.log" \
+    "$live_log" || true
 
   if [[ "$status" -eq 0 ]]; then
     echo "RPM rebuild finished: $package_name - elapsed $elapsed_text" >&2
@@ -924,13 +948,11 @@ rpm_mock_out_with_binds(){
 
   mkdir -p "$result"
   if out="$(mock -r "$effective_target" "${mock_args[@]}" "$@" 2>&1)"; then
-    printf '%s
-' "$out"
+    printf '%s\n' "$out"
     return 0
   fi
 
-  printf '%s
-' "$out" >&2
+  printf '%s\n' "$out" >&2
   rpm_mock_repo_failure_debug "$result" "$target" "$effective_target" "failure-${phase}-mock-bind-command" "${mock_args[@]}"
   rpm_dump_mock_failure "$result" "$msg"
   die "$msg"
