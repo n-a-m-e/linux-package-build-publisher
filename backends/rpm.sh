@@ -779,6 +779,125 @@ rpm_mock_with_args(){
   die "$msg"
 }
 
+
+rpm_format_elapsed(){
+  local seconds="${1:-0}"
+
+  [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=0
+  printf '%dm%02ds' "$((seconds / 60))" "$((seconds % 60))"
+}
+
+rpm_rebuild_phase_markers_from_log(){
+  local log="$1"
+
+  [[ -f "$log" ]] || return 0
+
+  awk '
+    function emit(marker) {
+      if (!seen[marker]++) print marker
+    }
+    /Executing\(%prep\)/ { emit("%prep"); next }
+    /Executing\(%generate_buildrequires\)/ { emit("%generate_buildrequires"); next }
+    /Executing\(%conf\)/ { emit("%conf"); next }
+    /Executing\(%build\)/ { emit("%build"); next }
+    /Executing\(%install\)/ { emit("%install"); next }
+    /Executing\(%check\)/ { emit("%check"); next }
+    /Executing\(%clean\)/ { emit("%clean"); next }
+    /Processing files:/ { emit("%files"); next }
+    /Checking for unpackaged file\(s\)/ { emit("unpackaged-file-check"); next }
+    /Wrote:[[:space:]]/ { emit("wrote-rpms"); next }
+  ' "$log" || true
+}
+
+rpm_rebuild_emit_new_phase_markers(){
+  local log="$1" reported_file="$2" package_name="$3" elapsed_text="$4"
+  local marker emitted=0
+
+  mkdir -p "$(dirname "$reported_file")"
+  touch "$reported_file"
+
+  while IFS= read -r marker; do
+    [[ -n "$marker" ]] || continue
+    if ! grep -Fxq -- "$marker" "$reported_file" 2>/dev/null; then
+      printf '%s\n' "$marker" >>"$reported_file"
+      echo "RPM rebuild phase: $package_name - $marker - elapsed $elapsed_text" >&2
+      emitted=1
+    fi
+  done < <(rpm_rebuild_phase_markers_from_log "$log")
+
+  [[ "$emitted" == 1 ]]
+}
+
+rpm_mock_rebuild_heartbeat_loop(){
+  local log="$1" reported_file="$2" package_name="$3" interval="$4" start="$5"
+  local now elapsed elapsed_text
+
+  while true; do
+    sleep "$interval" || exit 0
+
+    now="$(date +%s)"
+    elapsed=$((now - start))
+    elapsed_text="$(rpm_format_elapsed "$elapsed")"
+
+    if ! rpm_rebuild_emit_new_phase_markers "$log" "$reported_file" "$package_name" "$elapsed_text"; then
+      echo "Still building $package_name - elapsed $elapsed_text" >&2
+    fi
+  done
+}
+
+rpm_mock_rebuild_with_heartbeat(){
+  local result="$1" msg="$2" target="$3" phase="$4" package_name="$5"
+  shift 5
+
+  local mock_args=() effective_target live_log reported_file heartbeat_pid status
+  local interval start now elapsed elapsed_text
+
+  interval="${RPM_BUILD_HEARTBEAT_SECONDS:-60}"
+  case "$interval" in
+    ''|*[!0-9]*|0) interval=60 ;;
+  esac
+
+  rpm_mock_args_array "$target" "$phase" mock_args
+  effective_target="$(rpm_effective_mock_target "$target")"
+
+  mkdir -p "$result"
+  live_log="$result/mock-rebuild-live.log"
+  reported_file="$result/mock-rebuild-heartbeat-phases.txt"
+  : >"$live_log"
+  : >"$reported_file"
+
+  rpm_mock_repo_debug "$result" "$target" "$effective_target" "before-${phase}-mock-rebuild-command" "${mock_args[@]}"
+
+  echo "Starting RPM rebuild: $package_name (heartbeat every ${interval}s; full output: ${live_log#$result/})" >&2
+
+  start="$(date +%s)"
+  rpm_mock_rebuild_heartbeat_loop "$live_log" "$reported_file" "$package_name" "$interval" "$start" &
+  heartbeat_pid="$!"
+
+  if mock -r "$effective_target" "${mock_args[@]}" "$@" >"$live_log" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+
+  kill "$heartbeat_pid" 2>/dev/null || true
+  wait "$heartbeat_pid" 2>/dev/null || true
+
+  now="$(date +%s)"
+  elapsed=$((now - start))
+  elapsed_text="$(rpm_format_elapsed "$elapsed")"
+  rpm_rebuild_emit_new_phase_markers "$live_log" "$reported_file" "$package_name" "$elapsed_text" || true
+
+  if [[ "$status" -eq 0 ]]; then
+    echo "RPM rebuild finished: $package_name - elapsed $elapsed_text" >&2
+    return 0
+  fi
+
+  rpm_mock_repo_failure_debug "$result" "$target" "$effective_target" "failure-${phase}-mock-rebuild-command" "${mock_args[@]}"
+  rpm_dump_mock_failure "$result" "$msg"
+  die "$msg"
+}
+
 rpm_mock_out_with_binds(){
   local result="$1" msg="$2" target="$3" phase="$4" bind_count="$5"
   shift 5
@@ -1448,7 +1567,13 @@ rpm_rebuild(){
     "$srpm" \
     "${common_args[@]}"
 
-  rpm_mock_with_args "$result" "mock rebuild failed for $(basename "$srpm")" "$target" build "${rebuild_args[@]}"
+  rpm_mock_rebuild_with_heartbeat \
+    "$result" \
+    "mock rebuild failed for $(basename "$srpm")" \
+    "$target" \
+    build \
+    "$(basename "$srpm")" \
+    "${rebuild_args[@]}"
 }
 
 cmd_rpm_list_sources_chroot(){
