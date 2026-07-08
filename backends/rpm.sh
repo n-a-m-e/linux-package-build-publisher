@@ -884,6 +884,9 @@ rpm_mock_rebuild_with_heartbeat(){
   reported_file="$result/mock-rebuild-heartbeat-phases.txt"
   : >"$live_log"
   : >"$reported_file"
+  # mock can leave build.log from an earlier run in the same result directory.
+  # Remove it so heartbeat phases and cached summaries only reflect this rebuild.
+  rm -f "$result/build.log"
 
   rpm_mock_repo_debug "$result" "$target" "$effective_target" "before-${phase}-mock-rebuild-command" "${mock_args[@]}"
 
@@ -1837,6 +1840,144 @@ rpm_cache_has_binary_rpms(){
 }
 
 
+rpm_cache_summary_path(){
+  local cache="$1"
+  printf '%s\n' "$cache/.build-summary.log"
+}
+
+rpm_cache_summary_print_file(){
+  local summary="$1" display_id="$2" lines
+
+  lines="${RPM_CACHE_SUMMARY_LINES:-250}"
+  case "$lines" in
+    ''|*[!0-9]*|0) lines=250 ;;
+  esac
+
+  if [[ -f "$summary" && -s "$summary" ]]; then
+    echo "--- cached RPM build summary for $display_id (last $lines lines) ---" >&2
+    tail -n "$lines" "$summary" >&2 || true
+    echo "--- end cached RPM build summary for $display_id ---" >&2
+  else
+    echo "No cached RPM build summary found for $display_id; this cache entry predates summary capture" >&2
+  fi
+}
+
+rpm_cache_summary_print(){
+  local cache="$1" display_id="$2"
+
+  rpm_cache_summary_print_file "$(rpm_cache_summary_path "$cache")" "$display_id"
+}
+
+rpm_summary_list_rpms(){
+  local root="$1" title="$2" kind="${3:-all}" count=0 file
+
+  echo "$title"
+  case "$kind" in
+    binary)
+      while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        count=$((count + 1))
+        printf '  - %s\n' "$(basename "$file")"
+      done < <(find "$root" -name '*.rpm' ! -name '*.src.rpm' -type f | sort)
+      ;;
+    source)
+      while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        count=$((count + 1))
+        printf '  - %s\n' "$(basename "$file")"
+      done < <(find "$root" -name '*.src.rpm' -type f | sort)
+      ;;
+    *)
+      while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        count=$((count + 1))
+        printf '  - %s\n' "$(basename "$file")"
+      done < <(find "$root" -name '*.rpm' -type f | sort)
+      ;;
+  esac
+  ((count)) || echo "  none"
+  echo "count=$count"
+  echo
+}
+
+rpm_summary_list_buildrequires(){
+  local result="$1" deps_file="$result/stepwise-buildrequires.txt" count=0 dep
+
+  echo "=== BuildRequires entries installed stepwise ==="
+  if [[ -f "$deps_file" ]]; then
+    while IFS= read -r dep; do
+      [[ -n "$dep" ]] || continue
+      count=$((count + 1))
+      printf '  - %s\n' "$dep"
+    done <"$deps_file"
+    echo "count=$count"
+  else
+    echo "not captured"
+  fi
+  echo
+}
+
+rpm_summary_transaction_sections(){
+  local result="$1" count=0 section pkg current=""
+
+  echo "=== package manager transactions captured from mock logs ==="
+  while IFS=$'\t' read -r section pkg; do
+    [[ -n "$section" && -n "$pkg" ]] || continue
+    count=$((count + 1))
+    if [[ "$section" != "$current" ]]; then
+      current="$section"
+      echo "[$section]"
+    fi
+    printf '  - %s\n' "$pkg"
+  done < <(rpm_diagnostic_transaction_packages_from_logs "$result")
+  ((count)) || echo "no transaction packages found in mock logs"
+  echo "count=$count"
+  echo
+}
+
+rpm_summary_build_phases(){
+  local result="$1" marker count=0
+
+  echo "=== RPM rebuild phases observed ==="
+  while IFS= read -r marker; do
+    [[ -n "$marker" ]] || continue
+    count=$((count + 1))
+    printf '  - %s\n' "$marker"
+  done < <(rpm_rebuild_phase_markers_from_logs "$result/build.log" "$result/mock-rebuild-live.log")
+  ((count)) || echo "no rebuild phase markers found"
+  echo "count=$count"
+  echo
+}
+
+rpm_write_cache_summary(){
+  local result="$1" cache="$2" target="$3" display_id="$4" fingerprint="$5" quick_fingerprint="$6"
+  local summary tmp
+
+  mkdir -p "$cache"
+  summary="$(rpm_cache_summary_path "$cache")"
+  tmp="$summary.tmp.$$"
+
+  {
+    echo "=== cached RPM build summary ==="
+    echo "package=$display_id"
+    echo "target=$target"
+    echo "created_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "fingerprint=$fingerprint"
+    echo "quick_fingerprint=$quick_fingerprint"
+    echo
+
+    rpm_summary_list_rpms "$result" "=== binary RPM artifacts ===" binary
+    rpm_summary_list_rpms "$result" "=== source RPM artifacts ===" source
+    rpm_summary_list_buildrequires "$result"
+    rpm_summary_build_phases "$result"
+    rpm_summary_transaction_sections "$result"
+  } >"$tmp"
+
+  mv "$tmp" "$summary"
+  echo "Cached RPM build summary captured: ${summary#$cache/}" >&2
+}
+
+
 rpm_target_config_fingerprint(){
   local package_type="$1"
   local family="$2"
@@ -1953,6 +2094,7 @@ rpm_build_queued(){
 
     if [[ "$cached_quick_fp" == "$quick_fp" ]] && rpm_cache_has_binary_rpms "$cache"; then
       echo "Using debug cached RPM artifacts for $target/$display_id: quick fingerprint matched" >&2
+      rpm_cache_summary_print "$cache" "$target/$display_id"
       rpm_copy_artifacts "$cache" "$repo" "$src_repo" "$local_repo"
       return 0
     fi
@@ -1983,6 +2125,7 @@ rpm_build_queued(){
     if [[ "$cache_fp" == "$fp" ]] && rpm_cache_has_binary_rpms "$cache"; then
       echo "Using cached RPM artifacts for $target/$display_id: SRPM fingerprint matched" >&2
       printf '%s' "$quick_fp" >"$cache/.quick-fingerprint"
+      rpm_cache_summary_print "$cache" "$target/$display_id"
       rpm_copy_artifacts "$cache" "$repo" "$src_repo" "$local_repo"
       return 0
     fi
@@ -1997,6 +2140,7 @@ rpm_build_queued(){
   fi
 
   RPM_LAYER_ROOT="$root" rpm_rebuild "$target" "$target-$source_safe-$build_id" "$result" "$local_repo" "$srpm" "$spec_path" "$url"
+  rpm_write_cache_summary "$result" "$cache" "$target" "$target/$display_id" "$fp" "$quick_fp"
   rm -f "$cache"/*.rpm "$cache"/*.src.rpm
   find "$result" -name '*.rpm' -type f -exec cp {} "$cache/" \;
   printf '%s' "$fp" >"$cache/.fingerprint"
