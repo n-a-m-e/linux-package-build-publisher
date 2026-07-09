@@ -456,12 +456,26 @@ rpm_effective_mock_target(){
   local target="$1" family arch root="${RPM_LAYER_ROOT:-}"
   local repo_files=() cfg_file safe_source safe_target derived_target file
   local release tmp_dir expanded mode replace_id rel current next section merged
+  local local_repo="${RPM_LOCAL_REPO_PATH:-}"
 
-  [[ -n "$root" && -d "$root" ]] || { printf '%s\n' "$target"; return 0; }
+  if [[ -z "$local_repo" && ( -z "$root" || ! -d "$root" ) ]]; then
+    printf '%s\n' "$target"
+    return 0
+  fi
 
   IFS=$'\t' read -r family arch < <(split_target "$target")
-  mapfile -t repo_files < <(rpm_layered_repo_files "$root" "$family" "$target")
-  ((${#repo_files[@]})) || { printf '%s\n' "$target"; return 0; }
+  if [[ -n "$root" && -d "$root" ]]; then
+    mapfile -t repo_files < <(rpm_layered_repo_files "$root" "$family" "$target")
+  fi
+
+  if [[ -z "$local_repo" && ${#repo_files[@]} -eq 0 ]]; then
+    printf '%s\n' "$target"
+    return 0
+  fi
+
+  if [[ -n "$local_repo" && ! -d "$local_repo" ]]; then
+    die "Local RPM repo path does not exist: $local_repo"
+  fi
 
   load_target rpm "$family" "$arch"
   release="${family#"${TARGET_LABEL_STRIP_PREFIX:-}"}"
@@ -539,6 +553,24 @@ rpm_effective_mock_target(){
         ;;
     esac
   done
+
+  if [[ -n "$local_repo" ]]; then
+    next="$tmp_dir/dnf.conf.next"
+    {
+      cat "$current"
+      printf '\n# repository-builder local build repo\n'
+      printf '[repository-builder-local]\n'
+      printf 'name=Repository Builder Local RPMs\n'
+      printf 'baseurl=file://%s\n' "$local_repo"
+      printf 'enabled=1\n'
+      printf 'gpgcheck=0\n'
+      printf 'repo_gpgcheck=0\n'
+      printf 'metadata_expire=0\n'
+      printf 'priority=1\n'
+      printf 'cost=1\n'
+    } >"$next"
+    mv "$next" "$current"
+  fi
 
   {
     printf "include('/etc/mock/%s.cfg')\n" "$target"
@@ -1005,15 +1037,14 @@ rpm_rebuild(){
   common_args=(
     --uniqueext "$unique"
     --enable-network
-    --addrepo "file://$local_repo"
     --resultdir "$result"
   )
   [[ -n "$url" ]] && common_args+=(--define "url $url")
 
   rebuild_args=("${common_args[@]}" --no-clean --rebuild "$srpm")
 
-  rpm_mock_with_args "$result" "mock init failed for $target" "$target" build "${common_args[@]}" --init
-  rpm_install_buildrequires_stepwise \
+  RPM_LOCAL_REPO_PATH="$local_repo" rpm_mock_with_args "$result" "mock init failed for $target" "$target" build "${common_args[@]}" --init
+  RPM_LOCAL_REPO_PATH="$local_repo" rpm_install_buildrequires_stepwise \
     "$result" \
     "mock build dependency install failed for $(basename "$srpm")" \
     "$target" \
@@ -1022,7 +1053,7 @@ rpm_rebuild(){
     "$deps_file" \
     "${common_args[@]}"
 
-  rpm_mock_rebuild_with_heartbeat \
+  RPM_LOCAL_REPO_PATH="$local_repo" rpm_mock_rebuild_with_heartbeat \
     "$result" \
     "mock rebuild failed for $(basename "$srpm")" \
     "$target" \
