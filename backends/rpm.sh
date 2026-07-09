@@ -1402,7 +1402,9 @@ rpm_queue_fingerprint(){
 
   {
     printf '%s\n' "$label" "$source_id" "$subdir" "$spec" "$target" "$arch" "$target_config_fp" "$package_fp"
-    [[ "$mode" == srpm ]] && sha256_file "$srpm"
+    if [[ "$mode" == srpm ]]; then
+      sha256_file "$srpm"
+    fi
   } | sha256_lines
 }
 
