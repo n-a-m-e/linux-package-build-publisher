@@ -2,9 +2,9 @@
 
 # RPM backend: mock, rpmbuild/rpmspec, createrepo, signing, graphing, publishing, and RPM-specific diagnostics.
 
-# Normal RPM builds should keep the GitHub log summary-first. Detailed
-# mock/repository diagnostics are still written under each package result
-# directory, but they are only printed inline when a command fails.
+# Normal RPM builds keep the GitHub log progress-first. Detailed mock and
+# repository diagnostics are written under each package result directory and
+# uploaded as the package log artifact.
 RPM_QUEUE_FINGERPRINT_VERSION=v5
 rpm_configure_signing(){
   cat >/root/.rpmmacros <<EOF
@@ -28,8 +28,8 @@ rpm_dump_mock_failure(){
     [[ -f "$log" ]] || continue
     rel="${log#$dir/}"
     found=1
-    echo "--- $rel (full log) ---" >&2
-    cat "$log" >&2 || true
+    echo "--- $rel (last 120 lines; full log is in package-logs) ---" >&2
+    tail -n 120 "$log" >&2 || true
   done
   shopt -u nullglob
 
@@ -48,14 +48,10 @@ rpm_emit_lines_section(){
 }
 
 rpm_log_lines_section(){
-  local log="$1" title="$2" inline="${3:-0}" leading_blank="${4:-1}"
+  local log="$1" title="$2" _inline="${3:-0}" leading_blank="${4:-1}"
   shift 4
 
-  if [[ "$inline" == 1 ]]; then
-    rpm_emit_lines_section "$title" "$leading_blank" "$@" | tee -a "$log" >&2
-  else
-    rpm_emit_lines_section "$title" "$leading_blank" "$@" >>"$log"
-  fi
+  rpm_emit_lines_section "$title" "$leading_blank" "$@" >>"$log"
 }
 
 rpm_write_srpm_buildrequires(){
@@ -100,96 +96,6 @@ rpm_write_srpm_buildrequires(){
 
   count="$(awk 'NF { count++ } END { print count + 0 }' "$deps_file")"
   echo "SRPM metadata captured: ${log#$result/} ($count BuildRequires entries)" >&2
-}
-
-rpm_dnf_transaction_report_from_output(){
-  local dep="$1" index="$2" total="$3" attempt="$4" status_label="$5" exit_status="$6" output="$7"
-
-  {
-    echo
-    echo "=== BuildRequires DNF transaction $index/$total ==="
-    echo "dependency=$dep"
-    echo "attempt=$attempt"
-    echo "status=$status_label"
-    echo "exit_status=$exit_status"
-    awk '
-      function normalize(line, out) {
-        out = line
-        sub(/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9:.]+Z[[:space:]]*/, "", out)
-        sub(/^DEBUG[[:space:]]+util\.py:[0-9]+:[[:space:]]*/, "", out)
-        sub(/^INFO[[:space:]]+util\.py:[0-9]+:[[:space:]]*/, "", out)
-        return out
-      }
-      function print_section(name) {
-        if (!printed[name]++) print "[" name "]"
-      }
-      function emit(line) {
-        print "  - " line
-        found = 1
-      }
-      {
-        line = normalize($0)
-        trimmed = line
-        sub(/^[[:space:]]+/, "", trimmed)
-      }
-      trimmed ~ /^Package .+ is already installed\./ {
-        print_section("Already installed")
-        emit(trimmed)
-        next
-      }
-      trimmed ~ /^(Installing|Installing dependencies|Installing weak dependencies|Installing group\/module packages|Upgrading|Downgrading|Reinstalling|Removing|Removing dependent packages|Removing unused dependencies|Obsoleting):[[:space:]]*$/ {
-        section = trimmed
-        sub(/:[[:space:]]*$/, "", section)
-        print_section(section)
-        in_summary = 0
-        in_error = 0
-        next
-      }
-      trimmed ~ /^Transaction Summary/ {
-        section = ""
-        in_summary = 1
-        in_error = 0
-        print_section("Transaction Summary")
-        next
-      }
-      trimmed ~ /^Error:/ {
-        section = ""
-        in_summary = 0
-        in_error = 1
-        print_section("DNF errors")
-        emit(trimmed)
-        next
-      }
-      in_error {
-        if (trimmed == "" || trimmed ~ /^(Child return code|kill orphans|Executing command:|Please ignore)/) {
-          in_error = 0
-          next
-        }
-        emit(trimmed)
-        next
-      }
-      in_summary {
-        if (trimmed == "" || trimmed ~ /^=+$/) next
-        if (trimmed ~ /^(Downloading Packages|Running transaction check|Running transaction test|Running transaction|Complete!|Error:|Is this ok)/) {
-          in_summary = 0
-          next
-        }
-        if (trimmed ~ /^(Install|Upgrade|Downgrade|Reinstall|Remove)[[:space:]]+[0-9]+[[:space:]]+Packages?/) emit(trimmed)
-        else if (trimmed ~ /^Total (download )?size:/) emit(trimmed)
-        next
-      }
-      section {
-        row = line
-        sub(/^[[:space:]]+/, "", row)
-        if (row == "" || row ~ /^=+$/ || row ~ /^Package[[:space:]]+Arch[[:space:]]+/) next
-        if (row ~ /^(error:|Error[[:space:]]|Warning:|warning:|DEBUG[[:space:]]|INFO[[:space:]])/) next
-        emit(row)
-      }
-      END {
-        if (!found) print "  no DNF transaction package rows found"
-      }
-    ' "$output" || true
-  }
 }
 
 rpm_layered_repo_files(){
@@ -633,56 +539,8 @@ rpm_format_elapsed(){
   printf '%dm%02ds' "$((seconds / 60))" "$((seconds % 60))"
 }
 
-rpm_rebuild_phase_markers_from_log(){
-  local log="$1"
-
-  [[ -f "$log" ]] || return 0
-
-  awk '
-    function emit(marker) {
-      if (!seen[marker]++) print marker
-    }
-    /Executing\(%prep\)/ { emit("%prep"); next }
-    /Executing\(%generate_buildrequires\)/ { emit("%generate_buildrequires"); next }
-    /Executing\(%conf\)/ { emit("%conf"); next }
-    /Executing\(%build\)/ { emit("%build"); next }
-    /Executing\(%install\)/ { emit("%install"); next }
-    /Executing\(%check\)/ { emit("%check"); next }
-    /Executing\(%clean\)/ { emit("%clean"); next }
-    /Processing files:/ { emit("%files"); next }
-    /Checking for unpackaged file\(s\)/ { emit("unpackaged-file-check"); next }
-    /Wrote:[[:space:]]/ { emit("wrote-rpms"); next }
-  ' "$log" || true
-}
-
-rpm_rebuild_emit_new_phase_markers(){
-  local reported_file="$1" package_name="$2" elapsed_text="$3"
-  shift 3
-
-  local marker emitted=0
-
-  mkdir -p "$(dirname "$reported_file")"
-  touch "$reported_file"
-
-  while IFS= read -r marker; do
-    [[ -n "$marker" ]] || continue
-    if ! grep -Fxq -- "$marker" "$reported_file" 2>/dev/null; then
-      printf '%s\n' "$marker" >>"$reported_file"
-      echo "RPM rebuild phase: $package_name - $marker - elapsed $elapsed_text" >&2
-      emitted=1
-    fi
-  done < <(
-    for log in "$@"; do
-      [[ -n "$log" && -f "$log" ]] || continue
-      rpm_rebuild_phase_markers_from_log "$log"
-    done | awk 'NF && !seen[$0]++'
-  )
-
-  [[ "$emitted" == 1 ]]
-}
-
 rpm_mock_rebuild_heartbeat_loop(){
-  local result="$1" live_log="$2" reported_file="$3" package_name="$4" interval="$5" start="$6"
+  local package_name="$1" interval="$2" start="$3"
   local now elapsed elapsed_text
 
   while true; do
@@ -692,17 +550,7 @@ rpm_mock_rebuild_heartbeat_loop(){
     elapsed=$((now - start))
     elapsed_text="$(rpm_format_elapsed "$elapsed")"
 
-    # mock --quiet can put the RPM phase markers in build.log rather than in
-    # the wrapper-captured stdout/stderr log, so scan both while still only
-    # printing each high-level marker once.
-    if ! rpm_rebuild_emit_new_phase_markers \
-      "$reported_file" \
-      "$package_name" \
-      "$elapsed_text" \
-      "$result/build.log" \
-      "$live_log"; then
-      echo "Still building $package_name - elapsed $elapsed_text" >&2
-    fi
+    echo "Still building $package_name - elapsed $elapsed_text" >&2
   done
 }
 
@@ -710,7 +558,7 @@ rpm_mock_rebuild_with_heartbeat(){
   local result="$1" msg="$2" target="$3" phase="$4" package_name="$5"
   shift 5
 
-  local mock_args=() effective_target live_log reported_file heartbeat_pid status
+  local mock_args=() effective_target live_log heartbeat_pid status
   local interval start now elapsed elapsed_text
 
   interval="${RPM_BUILD_HEARTBEAT_SECONDS:-60}"
@@ -722,17 +570,15 @@ rpm_mock_rebuild_with_heartbeat(){
 
   mkdir -p "$result"
   live_log="$result/mock-rebuild-live.log"
-  reported_file="$result/mock-rebuild-heartbeat-phases.txt"
   : >"$live_log"
-  : >"$reported_file"
   # mock can leave build.log from an earlier run in the same result directory.
-  # Remove it so heartbeat phases and cached summaries only reflect this rebuild.
+  # Remove it so cached logs only reflect this rebuild.
   rm -f "$result/build.log"
 
-  echo "Starting RPM rebuild: $package_name (heartbeat every ${interval}s; full output: ${live_log#$result/}; phases: build.log)" >&2
+  echo "Starting RPM rebuild: $package_name (heartbeat every ${interval}s; full output: ${live_log#$result/})" >&2
 
   start="$(date +%s)"
-  rpm_mock_rebuild_heartbeat_loop "$result" "$live_log" "$reported_file" "$package_name" "$interval" "$start" &
+  rpm_mock_rebuild_heartbeat_loop "$package_name" "$interval" "$start" &
   heartbeat_pid="$!"
 
   if mock -r "$effective_target" "${mock_args[@]}" "$@" >"$live_log" 2>&1; then
@@ -747,12 +593,6 @@ rpm_mock_rebuild_with_heartbeat(){
   now="$(date +%s)"
   elapsed=$((now - start))
   elapsed_text="$(rpm_format_elapsed "$elapsed")"
-  rpm_rebuild_emit_new_phase_markers \
-    "$reported_file" \
-    "$package_name" \
-    "$elapsed_text" \
-    "$result/build.log" \
-    "$live_log" || true
 
   if [[ "$status" -eq 0 ]]; then
     echo "RPM rebuild finished: $package_name - elapsed $elapsed_text" >&2
@@ -858,9 +698,9 @@ rpm_finalize_stepwise_buildroot(){
 }
 
 rpm_buildrequires_install_attempt(){
-  local result="$1" effective_target="$2" log="$3" txn_log="$4" dep="$5" index="$6" total="$7" attempt="$8" success_status="$9"
-  local -n install_args="${10}"
-  shift 10
+  local result="$1" effective_target="$2" log="$3" dep="$4" index="$5" total="$6" attempt="$7" success_status="$8"
+  local -n install_args="${9}"
+  shift 9
 
   local mock_args=("$@") cmd_output status status_label
 
@@ -873,8 +713,12 @@ rpm_buildrequires_install_attempt(){
     status_label="failed"
   fi
 
-  cat "$cmd_output" >>"$log"
-  rpm_dnf_transaction_report_from_output "$dep" "$index" "$total" "$attempt" "$status_label" "$status" "$cmd_output" | tee -a "$txn_log" >&2
+  {
+    echo
+    echo "--- raw mock install output ($index/$total, attempt=$attempt, status=$status_label, exit_status=$status) ---"
+    cat "$cmd_output"
+    echo "--- end raw mock install output ---"
+  } >>"$log"
   rm -f "$cmd_output"
 
   return "$status"
@@ -885,13 +729,12 @@ rpm_install_buildrequires_stepwise(){
   shift 6
 
   local common_args=("$@") target_args=() mock_args=() effective_target
-  local log txn_log dep status index total
+  local log dep status index total
   local install_flags=(-y --setopt=tsflags=noscripts,notriggers)
   local retry_flags=(-y --allowerasing --setopt=tsflags=noscripts,notriggers)
 
   mkdir -p "$result"
   log="$result/stepwise-buildrequires.log"
-  txn_log="$result/stepwise-buildrequires-transactions.log"
 
   [[ -f "$deps_file" ]] || die "Missing BuildRequires list for stepwise install: $deps_file"
   total="$(awk 'NF { count++ } END { print count + 0 }' "$deps_file")"
@@ -925,15 +768,6 @@ rpm_install_buildrequires_stepwise(){
     echo
   } >"$log"
 
-  {
-    echo "=== stepwise BuildRequires DNF transaction results ==="
-    echo "target=$target"
-    echo "effective_target=$effective_target"
-    echo "phase=$phase"
-    echo "srpm=$srpm"
-    echo "count=$total"
-  } >"$txn_log"
-
   if [[ "$total" -eq 0 ]]; then
     local skip_status=(
       "status=no-buildrequires"
@@ -941,7 +775,6 @@ rpm_install_buildrequires_stepwise(){
     )
 
     rpm_log_lines_section "$log" "no BuildRequires entries" 1 0 "${skip_status[@]}"
-    rpm_log_lines_section "$txn_log" "no BuildRequires transactions" 0 1 "${skip_status[@]}"
     return 0
   fi
 
@@ -958,7 +791,7 @@ rpm_install_buildrequires_stepwise(){
       "dependency=$dep" \
       "mock -r $effective_target ... --pm-cmd install ${install_flags[*]} $dep"
 
-    if rpm_buildrequires_install_attempt "$result" "$effective_target" "$log" "$txn_log" "$dep" "$index" "$total" "normal" "installed" install_flags "${mock_args[@]}"; then
+    if rpm_buildrequires_install_attempt "$result" "$effective_target" "$log" "$dep" "$index" "$total" "normal" "installed" install_flags "${mock_args[@]}"; then
       echo "status=installed" >>"$log"
     else
       status=$?
@@ -973,7 +806,7 @@ rpm_install_buildrequires_stepwise(){
         "retry_strategy=mock --pm-cmd install ${retry_flags[*]} <BuildRequires-entry>" \
         "mock -r $effective_target ... --pm-cmd install ${retry_flags[*]} $dep"
 
-      if rpm_buildrequires_install_attempt "$result" "$effective_target" "$log" "$txn_log" "$dep" "$index" "$total" "allowerasing-retry" "installed-after-allowerasing" retry_flags "${mock_args[@]}"; then
+      if rpm_buildrequires_install_attempt "$result" "$effective_target" "$log" "$dep" "$index" "$total" "allowerasing-retry" "installed-after-allowerasing" retry_flags "${mock_args[@]}"; then
         echo "status=installed-after-allowerasing" >>"$log"
       else
         status=$?
@@ -1297,7 +1130,7 @@ rpm_cache_has_required_artifacts(){
 
 
 rpm_cache_store_result_logs(){
-  local result="$1" srpm_dir="$2" cache="$3"
+  local result="$1" cache="$2"
   local archive="$cache/.result-logs.tar.gz" tmp tmpdir
 
   mkdir -p "$cache"
@@ -1310,15 +1143,6 @@ rpm_cache_store_result_logs(){
     -C "$result" \
     -cf - . | tar -C "$tmpdir" -xf -
 
-  if [[ -d "$srpm_dir" ]]; then
-    mkdir -p "$tmpdir/srpm-build-logs"
-    tar \
-      --exclude='*.rpm' \
-      --exclude='*.src.rpm' \
-      -C "$srpm_dir" \
-      -cf - . | tar -C "$tmpdir/srpm-build-logs" -xf -
-  fi
-
   tar -C "$tmpdir" -czf "$tmp" .
   rm -rf "$tmpdir"
   mv "$tmp" "$archive"
@@ -1329,7 +1153,7 @@ rpm_cache_restore_result_logs(){
   local archive="$cache/.result-logs.tar.gz"
 
   [[ -s "$archive" ]] || return 1
-  mkdir -p "$result"
+  fresh_dir "$result"
   tar -C "$result" -xzf "$archive"
 }
 
@@ -1362,14 +1186,10 @@ rpm_cache_summary_print(){
   fi
 
   if [[ -n "${replay_report:-}" ]]; then
-    echo "--- RPM package cache replay for $display_id ---" >&2
-    cat "$replay_report" >&2 || true
-    echo "--- end RPM package cache replay for $display_id ---" >&2
+    echo "RPM cache replay for $display_id: restored package logs to ${result#/work/}" >&2
   fi
 
-  echo "--- RPM dependency/build report for $display_id ---" >&2
-  cat "$report" >&2 || true
-  echo "--- end RPM dependency/build report for $display_id ---" >&2
+  echo "RPM dependency/build report for $display_id: ${report#$result/}" >&2
 }
 
 rpm_report_artifacts(){
@@ -1503,19 +1323,20 @@ rpm_build_queued(){
   display_id="$source_id/$build_id"
   cache="/package-cache/rpm/$PRIMARY_APP/$target/$source_safe/$build_id"
   work="/work/rpm-build/$target/$source_safe/$build_id"
-  srpm_dir="/work/rpm-srpm/$target/$source_safe/$build_id"
   result="/work/rpm-result/$target/$source_safe/$build_id"
+  srpm_dir="$result/srpm-build-logs"
   repo="$PUBLIC_DIR/$repo_path"
   src_repo="$repo/source"
   local_repo="/work/localrepo-$target"
   root="/work/work/$source_id"
   mode="$(rpm_cache_mode)"
 
-  mkdir -p "$cache" "$result" "$repo" "$src_repo" "$local_repo"
+  mkdir -p "$cache" "$repo" "$src_repo" "$local_repo"
+  fresh_dir "$result"
+  mkdir -p "$srpm_dir"
   rpm_update_local_repo "$local_repo"
 
   fresh_dir "$work"
-  fresh_dir "$srpm_dir"
   copy_source_tree "$work/src" "$root"
   if ! spec_path="$(rpm_prepare_effective "$work/src" "$SUBDIR" "$SPEC" "$root" "$family" "$target")"; then
     die "RPM spec preparation failed for $SPEC on $target"
@@ -1584,7 +1405,7 @@ rpm_build_queued(){
     "$target/$display_id" \
     "$fp" \
     "$quick_fp"
-  rpm_cache_store_result_logs "$result" "$srpm_dir" "$cache"
+  rpm_cache_store_result_logs "$result" "$cache"
   rm -f "$cache"/*.rpm "$cache"/*.src.rpm
   find "$result" -name '*.rpm' -type f -exec cp {} "$cache/" \;
   printf '%s' "$fp" >"$cache/.fingerprint"
