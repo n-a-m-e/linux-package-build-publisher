@@ -70,7 +70,7 @@ cmd_package_build_queue(){
   fi
 
   [[ "$sub" == add ]] || die "Usage: package-build-queue add [--clone-url URL] [--ref REF] [--subdir DIR] [--spec SPEC] [--package NAME] [--source-id ID]"
-  [[ "${PACKAGE_TYPE:-}" != rpm ]] || die "RPM package-build-queue declarations are disabled; use layered specs/*.spec instead."
+  [[ "${PACKAGE_TYPE:-}" != rpm ]] || die "RPM package-build-queue declarations are disabled; use layered specs/*.spec or specs/<layer>/*.spec instead."
 
   while (($#)); do
     case "$1" in
@@ -369,4 +369,3 @@ ordered_queue_files(){
 
   ((${#out_files[@]})) || die "$backend graph produced no build queue entries for $target"
 }
-
