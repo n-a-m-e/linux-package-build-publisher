@@ -200,7 +200,7 @@ rpm_layered_repo_files(){
     if [[ "$layer" == "." ]]; then
       pattern="$root/repos/*.repo"
     else
-      pattern="$root/$layer/repos/*.repo"
+      pattern="$root/repos/$layer/*.repo"
     fi
 
     if matches="$(compgen -G "$pattern")"; then
@@ -1773,6 +1773,7 @@ rpm_prepare_target_queue(){
         ! -name macros \
         ! -name patches \
         ! -name replacements \
+        ! -name repos \
         ! -name specs \
         -printf '%f\n' | sort | while IFS= read -r subdir; do
           [[ -f "$root/$subdir/$subdir.spec" ]] && printf '%s\n' "$subdir"
