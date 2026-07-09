@@ -1288,6 +1288,7 @@ rpm_cache_has_required_artifacts(){
   local cache="$1"
 
   [[ -s "$cache/.build-summary.log" ]] || return 1
+  [[ -s "$cache/.result-logs.tar.gz" ]] || return 1
   find "$cache" -maxdepth 1 -type f \
     -name '*.rpm' \
     ! -name '*.src.rpm' \
@@ -1295,41 +1296,80 @@ rpm_cache_has_required_artifacts(){
 }
 
 
+rpm_cache_store_result_logs(){
+  local result="$1" srpm_dir="$2" cache="$3"
+  local archive="$cache/.result-logs.tar.gz" tmp tmpdir
+
+  mkdir -p "$cache"
+  tmp="$archive.tmp.$$"
+  tmpdir="$(mktemp -d /tmp/repository-builder-result-logs.XXXXXX)"
+
+  tar \
+    --exclude='*.rpm' \
+    --exclude='*.src.rpm' \
+    -C "$result" \
+    -cf - . | tar -C "$tmpdir" -xf -
+
+  if [[ -d "$srpm_dir" ]]; then
+    mkdir -p "$tmpdir/srpm-build-logs"
+    tar \
+      --exclude='*.rpm' \
+      --exclude='*.src.rpm' \
+      -C "$srpm_dir" \
+      -cf - . | tar -C "$tmpdir/srpm-build-logs" -xf -
+  fi
+
+  tar -C "$tmpdir" -czf "$tmp" .
+  rm -rf "$tmpdir"
+  mv "$tmp" "$archive"
+}
+
+rpm_cache_restore_result_logs(){
+  local cache="$1" result="$2"
+  local archive="$cache/.result-logs.tar.gz"
+
+  [[ -s "$archive" ]] || return 1
+  mkdir -p "$result"
+  tar -C "$result" -xzf "$archive"
+}
+
 rpm_cache_summary_print(){
   local cache="$1" display_id="$2" result="${3:-}"
   local summary="$cache/.build-summary.log"
-  local report="$summary" tmp
+  local report="$summary" replay_report tmp
 
   [[ -s "$summary" ]] || die "Missing cached RPM dependency/build report for $display_id: $summary"
 
   if [[ -n "$result" ]]; then
-    mkdir -p "$result"
-    report="$result/rpm-build-report.log"
-    tmp="$report.tmp.$$"
+    rpm_cache_restore_result_logs "$cache" "$result" || die "Missing cached RPM result logs for $display_id: $cache/.result-logs.tar.gz"
+
+    replay_report="$result/rpm-cache-replay.log"
+    tmp="$replay_report.tmp.$$"
     {
-      echo "=== RPM dependency/build report replay ==="
+      echo "=== RPM package cache replay ==="
       echo "package=$display_id"
       echo "cache_status=reused"
       echo "replayed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       echo "cached_report=$summary"
+      echo "cached_result_logs=$cache/.result-logs.tar.gz"
+      echo "restored_result=$result"
       echo
-      cat "$summary"
     } >"$tmp"
-    mv "$tmp" "$report"
+    mv "$tmp" "$replay_report"
+
+    report="$result/rpm-build-report.log"
+    [[ -s "$report" ]] || report="$summary"
+  fi
+
+  if [[ -n "${replay_report:-}" ]]; then
+    echo "--- RPM package cache replay for $display_id ---" >&2
+    cat "$replay_report" >&2 || true
+    echo "--- end RPM package cache replay for $display_id ---" >&2
   fi
 
   echo "--- RPM dependency/build report for $display_id ---" >&2
   cat "$report" >&2 || true
   echo "--- end RPM dependency/build report for $display_id ---" >&2
-}
-
-rpm_report_file(){
-  local title="$1" file="$2"
-
-  echo "=== $title ==="
-  [[ -f "$file" ]] || die "Missing RPM report input: $file"
-  cat "$file"
-  echo
 }
 
 rpm_report_artifacts(){
@@ -1357,9 +1397,10 @@ rpm_report_artifacts(){
 rpm_write_cache_summary(){
   local result="$1" cache="$2" target="$3" display_id="$4" fingerprint="$5" quick_fingerprint="$6"
   local summary="$cache/.build-summary.log" report="$result/rpm-build-report.log" tmp
+  local file rel
 
   mkdir -p "$cache" "$result"
-  tmp="$report.tmp.$$"
+  tmp="$summary.tmp.$$"
 
   {
     echo "=== RPM dependency/build report ==="
@@ -1373,10 +1414,20 @@ rpm_write_cache_summary(){
 
     rpm_report_artifacts "binary RPM artifacts" "$result" binary
     rpm_report_artifacts "source RPM artifacts" "$result" source
-    rpm_report_file "SRPM metadata and requested BuildRequires" "$result/srpm-buildrequires.log"
-    rpm_report_file "requested BuildRequires list" "$result/stepwise-buildrequires.txt"
-    rpm_report_file "exact stepwise BuildRequires DNF log" "$result/stepwise-buildrequires.log"
-    rpm_report_file "stepwise BuildRequires DNF transaction summary" "$result/stepwise-buildrequires-transactions.log"
+
+    echo "=== package log files ==="
+    while IFS= read -r file; do
+      rel="${file#$result/}"
+      printf '  - %s\n' "$rel"
+    done < <(
+      find "$result" \
+        -type f \
+        ! -name '*.rpm' \
+        ! -name '*.src.rpm' \
+        ! -name 'rpm-build-report.log' \
+        -print | sort
+    )
+    echo
   } >"$tmp"
 
   mv "$tmp" "$report"
@@ -1533,6 +1584,7 @@ rpm_build_queued(){
     "$target/$display_id" \
     "$fp" \
     "$quick_fp"
+  rpm_cache_store_result_logs "$result" "$srpm_dir" "$cache"
   rm -f "$cache"/*.rpm "$cache"/*.src.rpm
   find "$result" -name '*.rpm' -type f -exec cp {} "$cache/" \;
   printf '%s' "$fp" >"$cache/.fingerprint"
