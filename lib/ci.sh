@@ -188,7 +188,7 @@ cmd_build_container(){
   ((${#groups[@]})) || die "$package_type requires targets."
 
   cache_root="package-cache/$package_type-v$PACKAGE_CACHE_SCHEMA"
-  mkdir -p "$cache_root"
+  mkdir -p "$cache_root" rpm-result
   {
     printf 'cache_schema=%s\n' "$PACKAGE_CACHE_SCHEMA"
     printf 'package_type=%s\n' "$package_type"
@@ -253,6 +253,7 @@ cmd_build_container(){
       -v "$PWD:/work/workspace" \
       -v "$PWD/publisher:/work/publisher" \
       -v "$PWD/public:/work/public" \
+      -v "$PWD/rpm-result:/work/rpm-result" \
       -v "$PWD/gpg-key:/work/gpg-key" \
       -v "$PWD/$cache_root:/package-cache" \
       "${cache_args[@]}" \
@@ -357,4 +358,3 @@ cmd_prepare(){
 
   write_output changed "$changed"
 }
-
