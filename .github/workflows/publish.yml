@@ -198,6 +198,14 @@ jobs:
           CACHE_MODE: ${{ inputs.cache-mode == 'off' && 'normal' || inputs.cache-mode }}
         run: bash publisher/repository_builder.sh build-container
 
+      - name: RPM | Upload package logs
+        if: always() && inputs.package-type == 'rpm'
+        uses: actions/upload-artifact@v5
+        with:
+          name: package-logs
+          path: rpm-result
+          if-no-files-found: warn
+
       - name: Package | Save package cache
         if: always() && (inputs.package-type == 'rpm' || inputs.package-type == 'deb')
         continue-on-error: true
