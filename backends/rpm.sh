@@ -1748,11 +1748,10 @@ rpm_prepare_target_queue(){
       rpm_queue_spec "$qdir" "$source_id-layered-$package" "$source_id" "$package" "$spec_name" "$package"
     done < <(layered_names "$root" "$family" "$target" specs '*.spec')
 
-    while IFS= read -r spec_path; do
-      spec_name="$(basename "$spec_path")"
-      package="${spec_name%.spec}"
-      subdir="$(dirname "${spec_path#$root/}")"
-      [[ "$subdir" == . ]] || subdir="${subdir#./}"
+    while IFS= read -r subdir; do
+      package="$(basename "$subdir")"
+      spec_name="$package.spec"
+      spec_path="$root/$subdir/$spec_name"
       key="$source_id|$package|$spec_name|$subdir"
       package_key="$source_id|$package"
       [[ -z "${queued[$key]+x}" ]] || continue
@@ -1760,11 +1759,25 @@ rpm_prepare_target_queue(){
       queued[$key]=1
       queued_package[$package_key]=1
       rpm_queue_spec "$qdir" "$source_id-repo-$package-$subdir" "$source_id" "$package" "$spec_name" "$subdir"
-    done < <(find "$root" \
-      -type d \( -name .git -o -name .github -o -name .cache -o -name __pycache__ -o -name BUILD -o -name RPMS -o -name SRPMS -o -name SOURCES -o -name tmp \) -prune \
-      -o -type f -name '*.spec' \
-      ! -path "$root/specs/*" \
-      -print | sort)
+    done < <(
+      find "$root" -mindepth 1 -maxdepth 1 -type d \
+        ! -name .git \
+        ! -name .github \
+        ! -name .cache \
+        ! -name __pycache__ \
+        ! -name BUILD \
+        ! -name RPMS \
+        ! -name SRPMS \
+        ! -name SOURCES \
+        ! -name tmp \
+        ! -name macros \
+        ! -name patches \
+        ! -name replacements \
+        ! -name specs \
+        -printf '%f\n' | sort | while IFS= read -r subdir; do
+          [[ -f "$root/$subdir/$subdir.spec" ]] && printf '%s\n' "$subdir"
+        done
+    )
   done
 
   printf '%s' "$qdir"
