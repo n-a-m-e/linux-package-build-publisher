@@ -195,7 +195,7 @@ jobs:
           REPO_NAME: ${{ github.event.repository.name }}
           FPR: ${{ steps.gpg.outputs.fingerprint }}
           TARGETS: ${{ inputs.targets }}
-          CACHE_MODE: ${{ inputs.cache-mode }}
+          CACHE_MODE: ${{ inputs.cache-mode == 'off' && 'normal' || inputs.cache-mode }}
         run: bash publisher/repository_builder.sh build-container
 
       - name: Package | Save package cache
