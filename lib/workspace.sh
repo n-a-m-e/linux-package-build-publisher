@@ -106,16 +106,19 @@ layer_names(){
 
 layered_files(){
   local root="$1" family="$2" target="$3" relglob="$4"
-  local layer pattern matches
+  local category pattern layer glob matches
+
+  category="${relglob%%/*}"
+  pattern="${relglob#*/}"
 
   while IFS= read -r layer; do
     if [[ "$layer" == "." ]]; then
-      pattern="$root/$relglob"
+      glob="$root/$category/$pattern"
     else
-      pattern="$root/$layer/$relglob"
+      glob="$root/$category/$layer/$pattern"
     fi
 
-    if matches="$(compgen -G "$pattern")"; then
+    if matches="$(compgen -G "$glob")"; then
       printf '%s\n' "$matches"
     fi
   done < <(layer_names "$family" "$target") | sort -u
@@ -146,7 +149,7 @@ layered_best_file(){
     if [[ "$layer" == "." ]]; then
       candidate="$root/$category/$name"
     else
-      candidate="$root/$layer/$category/$name"
+      candidate="$root/$category/$layer/$name"
     fi
 
     [[ -f "$candidate" ]] && best="$candidate"
@@ -167,7 +170,7 @@ layered_existing_files(){
     if [[ "$layer" == "." ]]; then
       candidate="$root/$category/$name"
     else
-      candidate="$root/$layer/$category/$name"
+      candidate="$root/$category/$layer/$name"
     fi
 
     [[ -f "$candidate" ]] && printf '%s\n' "$candidate"
@@ -258,4 +261,3 @@ copy_source_tree(){
     fi
   fi
 }
-
